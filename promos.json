@@ -1,0 +1,52 @@
+{
+  "promos": [
+    {
+      "kicker": "JOIN",
+      "title": "Become a Member",
+      "body": "Best access windows, priority booking, and member perks.",
+      "ctaText": "Join",
+      "ctaUrl": "https://allbirdies.powerappsportals.com/join/",
+      "target": { "isMember": false }
+    },
+    {
+      "kicker": "LEAGUES",
+      "title": "Weeknight Scramble League",
+      "body": "8-week season + playoffs. Ask about the next start date.",
+      "ctaText": "Learn more",
+      "ctaUrl": "https://allbirdies.powerappsportals.com/leagues/",
+      "target": { }
+    },
+    {
+      "kicker": "CORPORATE",
+      "title": "Team Outings & Events",
+      "body": "Book bay blocks for your team—perfect for happy hours and team building.",
+      "ctaText": "Inquire",
+      "ctaUrl": "https://allbirdies.powerappsportals.com/corporate/",
+      "target": { }
+    },
+    {
+      "kicker": "NIGHT OWL",
+      "title": "Off-Peak = Best Value",
+      "body": "Overnight sessions are quieter and priced right—great for practice.",
+      "ctaText": "Book now",
+      "ctaUrl": "https://allbirdies.powerappsportals.com/book/",
+      "target": { }
+    },
+    {
+      "kicker": "REFERRAL",
+      "title": "Bring a Buddy",
+      "body": "Ask about referral credit for members.",
+      "ctaText": "Details",
+      "ctaUrl": "https://allbirdies.powerappsportals.com/referrals/",
+      "target": { "isMember": true }
+    },
+    {
+      "kicker": "HELP",
+      "title": "Need Help?",
+      "body": "Scan the QR on screen for quick fixes and support.",
+      "ctaText": "Help",
+      "ctaUrl": "https://allbirdies.powerappsportals.com/bay-help/",
+      "target": { }
+    }
+  ]
+}
