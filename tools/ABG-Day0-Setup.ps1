@@ -40,7 +40,7 @@ param(
   # Config template
   [switch]$WriteAgentConfigTemplate = $true,
 
-  # ---- NEW: Dataverse ConfigItem registration ----
+  # ---- Dataverse ConfigItem registration ----
   [switch]$RegisterConfigItems = $false,
   [string]$EnvironmentUrl = "",
   [string]$TenantId = "",
@@ -176,10 +176,21 @@ function Write-AgentConfigTemplateIfMissing([string]$path) {
 
 function Ensure-SessionDisplayPersistentFiles([string]$dataDir) {
   Ensure-Dir $dataDir
+
+  # ensure promos assets folder exists (used by PromosPack /MIR installs)
+  Ensure-Dir (Join-Path $dataDir "promos")
+
   $sessionJson = Join-Path $dataDir "session.json"
   $promosJson  = Join-Path $dataDir "promos.json"
-  if (-not (Test-Path $sessionJson)) { '{"status":"idle","updatedUtc":""}' | Set-Content -LiteralPath $sessionJson -Encoding UTF8 }
-  if (-not (Test-Path $promosJson))  { '{ "items": [] }' | Set-Content -LiteralPath $promosJson  -Encoding UTF8 }
+
+  if (-not (Test-Path $sessionJson)) {
+    '{"status":"idle","updatedUtc":""}' | Set-Content -LiteralPath $sessionJson -Encoding UTF8
+  }
+
+  # use the schema we expect: { "promos": [] }
+  if (-not (Test-Path $promosJson))  {
+    '{ "promos": [] }' | Set-Content -LiteralPath $promosJson -Encoding UTF8
+  }
 }
 
 function Create-WatchdogTask([string]$watchdogPath) {
@@ -204,7 +215,7 @@ function Create-AgentTask([string]$agentHostPath, [string]$kioskAccount, [string
   Write-Host "Created/updated scheduled task: $tn (ONLOGON for $kioskAccount, Interactive)"
 }
 
-# ---------- Dataverse helpers (NEW) ----------
+# ---------- Dataverse helpers ----------
 
 function Get-ClientSecretFromDpapiFile([string]$path) {
   if (-not (Test-Path -LiteralPath $path)) { throw "DPAPI secret file not found: $path" }
@@ -230,10 +241,10 @@ function Get-DataverseToken([string]$envUrl, [string]$tenantId, [string]$clientI
 function Invoke-Dv([string]$method, [string]$envUrl, [string]$path, [string]$token, $body = $null) {
   $uri = $envUrl.TrimEnd("/") + "/api/data/v9.2/" + $path.TrimStart("/")
   $headers = @{
-    Authorization    = "Bearer $token"
+    Authorization      = "Bearer $token"
     "OData-MaxVersion" = "4.0"
     "OData-Version"    = "4.0"
-    Accept            = "application/json"
+    Accept             = "application/json"
   }
   if ($method -in @("POST","PATCH","PUT")) {
     $headers["Content-Type"] = "application/json; charset=utf-8"
@@ -247,7 +258,6 @@ function Invoke-Dv([string]$method, [string]$envUrl, [string]$path, [string]$tok
 }
 
 function Get-ChoiceValueByLabel([string]$envUrl, [string]$token, [string]$entityLogical, [string]$attrLogical, [string]$labelToFind) {
-  # Fetch picklist metadata for the attribute
   $metaPath = "EntityDefinitions(LogicalName='$entityLogical')/Attributes(LogicalName='$attrLogical')/Microsoft.Dynamics.CRM.PicklistAttributeMetadata?`$select=LogicalName&`$expand=OptionSet(`$select=Options)"
   $meta = Invoke-Dv -method "GET" -envUrl $envUrl -path $metaPath -token $token
 
@@ -261,7 +271,6 @@ function Get-ChoiceValueByLabel([string]$envUrl, [string]$token, [string]$entity
 }
 
 function Upsert-ConfigItemForBay([string]$envUrl, [string]$token, [guid]$bayGuid, [int]$scopeValue, [string]$keyName, [string]$val) {
-  # Query existing record by Bay + Key
   $filter = "$Cfg_KeyField eq '$keyName' and _${Cfg_BayLookupField}_value eq $bayGuid"
   $qry = "$ConfigItemEntitySet?`$select=$ConfigItemIdField&`$filter=$filter"
   $res = Invoke-Dv -method "GET" -envUrl $envUrl -path $qry -token $token
@@ -309,36 +318,47 @@ $sessionDir    = Join-Path $AllBirdiesRoot "SessionDisplay"
   (Join-Path $sessionDir "releases"),
   (Join-Path $sessionDir "staging"),
   (Join-Path $sessionDir "data"),
+  (Join-Path $sessionDir "data\promos"),
   (Join-Path $sessionDir "edge-profile")
 ) | ForEach-Object { Ensure-Dir $_ }
 
 Ensure-SessionDisplayPersistentFiles -dataDir (Join-Path $sessionDir "data")
 
 Write-Step "Download bootstrap/tools scripts"
-$agentHostPath   = Join-Path $bayAgentDir "bootstrap\ABG.AgentHost.ps1"
-$watchdogPath    = Join-Path $bayAgentDir "bootstrap\ABG.HostWatchdog.ps1"
-$updateAgentPath = Join-Path $bayAgentDir "tools\Update-BayAgent.ps1"
-$updateDispPath  = Join-Path $bayAgentDir "tools\Update-SessionDisplay.ps1"
+$agentHostPath     = Join-Path $bayAgentDir "bootstrap\ABG.AgentHost.ps1"
+$watchdogPath      = Join-Path $bayAgentDir "bootstrap\ABG.HostWatchdog.ps1"
+$updateAgentPath   = Join-Path $bayAgentDir "tools\Update-BayAgent.ps1"
+$updateDispPath    = Join-Path $bayAgentDir "tools\Update-SessionDisplay.ps1"
 
-Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/bootstrap/ABG.AgentHost.ps1")       -outPath $agentHostPath
-Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/bootstrap/ABG.HostWatchdog.ps1")   -outPath $watchdogPath
-Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/tools/Update-BayAgent.ps1")        -outPath $updateAgentPath
-Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/tools/Update-SessionDisplay.ps1") -outPath $updateDispPath
+# NEW: Promos pack updater
+$updatePromosPath  = Join-Path $bayAgentDir "tools\Update-PromosPack.ps1"
+
+Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/bootstrap/ABG.AgentHost.ps1")         -outPath $agentHostPath
+Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/bootstrap/ABG.HostWatchdog.ps1")     -outPath $watchdogPath
+Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/tools/Update-BayAgent.ps1")          -outPath $updateAgentPath
+Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/tools/Update-SessionDisplay.ps1")   -outPath $updateDispPath
+
+# NEW: download promos pack updater
+Download-File -url ($FleetRawBaseUrl.TrimEnd("/") + "/tools/Update-PromosPack.ps1")        -outPath $updatePromosPath
 
 Write-Step "Create/trust code-signing certificate"
 $cert = Get-CodeSigningCertOrCreate
 
-Write-Step "Grant BayKiosk access to private key file (Crypto\\Keys)"
+Write-Step "Grant BayKiosk access to private key file (Crypto\Keys)"
 $kioskAccount = "$env:COMPUTERNAME\$BayKioskUser"
 $uniqueName = Get-CertUniqueContainerName -thumbprint $cert.Thumbprint
 Write-Host "Unique container name: $uniqueName"
 Grant-Kiosk-KeyAccess -uniqueName $uniqueName -kioskAccount $kioskAccount
 
 Write-Step "Sign bootstrap/tools scripts"
-Sign-File -path $agentHostPath   -cert $cert
-Sign-File -path $watchdogPath    -cert $cert
-Sign-File -path $updateAgentPath -cert $cert
-Sign-File -path $updateDispPath  -cert $cert
+Sign-File -path $agentHostPath     -cert $cert
+Sign-File -path $watchdogPath      -cert $cert
+Sign-File -path $updateAgentPath   -cert $cert
+Sign-File -path $updateDispPath    -cert $cert
+
+# NEW: sign promos updater
+Sign-File -path $updatePromosPath  -cert $cert
+
 Write-Host "All bootstrap/tools scripts signed and valid."
 
 Write-Step "Write agent-config.json template (if missing)"
@@ -351,7 +371,7 @@ Write-Step "Scheduled tasks"
 if ($CreateWatchdogTask) { Create-WatchdogTask -watchdogPath $watchdogPath }
 if ($CreateAgentTask)    { Create-AgentTask -agentHostPath $agentHostPath -kioskAccount $kioskAccount -kioskPassword $BayKioskPassword }
 
-# ---- NEW: Dataverse registration ----
+# ---- Dataverse registration ----
 if ($RegisterConfigItems) {
   Write-Step "Dataverse: Register per-bay ConfigItems (thumbprint + key unique name)"
 
@@ -368,7 +388,6 @@ if ($RegisterConfigItems) {
   $secret = Get-ClientSecretFromDpapiFile -path $ClientSecretDpapiPath
   $token  = Get-DataverseToken -envUrl $EnvironmentUrl -tenantId $TenantId -clientId $ClientId -clientSecret $secret
 
-  # Get Scope option value by label "Bay" from metadata (no hardcoding)
   $scopeBayValue = Get-ChoiceValueByLabel -envUrl $EnvironmentUrl -token $token -entityLogical "build_configitem" -attrLogical $Cfg_ScopeField -labelToFind "Bay"
   Write-Host "Resolved ConfigItem scope 'Bay' option value: $scopeBayValue"
 
@@ -396,3 +415,4 @@ Write-Host "SessionDisplay root: $sessionDir"
 Write-Host "Code signing thumbprint: $($cert.Thumbprint)"
 Write-Host "Key unique name: $uniqueName"
 Write-Host "Kiosk key ACL granted to: $kioskAccount"
+Write-Host "PromosPack updater installed at: $updatePromosPath"
