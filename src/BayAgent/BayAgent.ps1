@@ -2879,6 +2879,29 @@ $resultObj = Execute-Command -CommandType $type -PayloadJson $payload -BayLabel 
         } "*"
 
         Write-Log "Command $cmdId succeeded." "INFO"
+
+        # Booking status write-back (non-fatal): update booking when session starts or ends.
+        try {
+            $payloadForBooking = $null
+            try { $payloadForBooking = Try-ParseJson $payload } catch {}
+            $bkId = if ($payloadForBooking) { Get-PropValue $payloadForBooking "bookingId" $null } else { $null }
+            if (-not [string]::IsNullOrWhiteSpace([string]$bkId)) {
+                $bkStatusCode = $null
+                if ($type -eq $CMD_STARTSESSION) {
+                    $bkMode = if ($payloadForBooking) { (Get-PropValue $payloadForBooking "mode" "").ToString().ToLowerInvariant() } else { "" }
+                    if ($bkMode -eq "start") { $bkStatusCode = 271980001 }  # In-process
+                }
+                elseif ($type -eq $CMD_ENDSESSION) {
+                    $bkStatusCode = 271980002  # Complete
+                }
+                if ($null -ne $bkStatusCode) {
+                    Patch-Row $token "build_bookings" $bkId @{ statuscode = $bkStatusCode } "*"
+                    Write-Log "Booking $bkId status updated to $bkStatusCode" "INFO"
+                }
+            }
+        } catch {
+            Write-Log "Booking status write-back failed (non-fatal): $($_.Exception.Message)" "WARN"
+        }
     }
     catch {
         $nowErr = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
