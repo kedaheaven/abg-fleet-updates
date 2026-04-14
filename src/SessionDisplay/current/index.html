@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>All Birdies Session Display</title>
+  <link rel="stylesheet" href="css/abg-display.css" />
+</head>
+
+<body>
+  <header class="abg-topbar">
+    <div class="abg-brand">
+      <img class="abg-brand__logo" src="assets/abg-logo.png" alt="All Birdies" onerror="this.style.display='none'" />
+      <div class="abg-brand__text">
+        <div class="abg-brand__name">ALL BIRDIES</div>
+        <div class="abg-brand__sub">INDOOR GOLF CLUB</div>
+      </div>
+      <div class="abg-brand__pill" id="headerBayPill" style="display:none;">BAY</div>
+    </div>
+
+    <div class="abg-topbar__right">
+      <div class="abg-topbar__clock" id="nowClock">--:--</div>
+    </div>
+    <div class="abg-topbar__rule" aria-hidden="true"></div>
+  </header>
+
+  <main class="abg-grid">
+    <section class="abg-card abg-session">
+      <div class="abg-session__meta">
+        <div class="abg-session__label">SESSION</div>
+        <div class="abg-session__bay" id="bayLabel">Bay</div>
+      </div>
+
+      <div class="abg-session__header">
+        <div class="abg-session__who">
+          <div class="abg-session__name" id="displayName">Guest</div>
+          <div class="abg-session__statusRow">
+            <div class="abg-pill" id="statusPill">READY</div>
+            <div class="abg-pill abg-pill--muted" id="memberPill" style="display:none;">Member</div>
+            <div class="abg-pill abg-pill--muted" id="tierPill" style="display:none;">Tier</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="abg-session__timer">
+        <div class="abg-session__countdown" id="countdown">--:--</div>
+        <div class="abg-session__banner" id="bannerText" style="display:none;"></div>
+        <div class="abg-session__detail" id="statusDetail"></div>
+
+        <div class="abg-progress" aria-hidden="true">
+          <div class="abg-progress__fill" id="progressFill" style="width:0%"></div>
+        </div>
+
+        <div class="abg-session__times">
+          <div class="abg-mini">
+            <div class="abg-mini__label">START</div>
+            <div class="abg-mini__value" id="startLocal">--:--</div>
+          </div>
+          <div class="abg-mini">
+            <div class="abg-mini__label">END</div>
+            <div class="abg-mini__value" id="endLocal">--:--</div>
+          </div>
+        </div>
+      </div>
+
+      <footer class="abg-session__footer">
+        <div class="abg-help">
+          <div class="abg-help__qr">
+            <img src="assets/help-qr.svg" alt="Help QR" onerror="this.style.display='none'" />
+          </div>
+          <div class="abg-help__text">
+            <div class="abg-help__title">Need help?</div>
+            <div class="abg-help__subtitle">Scan the QR for bay help &amp; text support.</div>
+            <div class="abg-help__url" id="helpUrlText">https://allbirdies.powerappsportals.com/bay-help/</div>
+          </div>
+        </div>
+
+        <div class="abg-debug" id="debugLine"></div>
+      </footer>
+    </section>
+
+    <section class="abg-card abg-promos">
+      <!-- promo background layers -->
+      <div class="abg-promos__bg" id="promoBg" aria-hidden="true"></div>
+      <div class="abg-promos__overlay abg-promos__overlay--dark" id="promoOverlay" aria-hidden="true"></div>
+
+      <!-- NEW: Promo QR (top-right) -->
+      <div class="abg-promos__qr" id="promoQrWrap" style="display:none;">
+        <div class="abg-promos__qrCaption" id="promoQrCaption">SCAN</div>
+        <img class="abg-promos__qrImg" id="promoQrImg" alt="Promo QR" />
+      </div>
+
+      <div class="abg-promos__label">TODAY'S CLUB NOTES</div>
+
+      <!-- flattened promo layout (no nested bubble) -->
+      <div class="abg-promos__content" id="promoCard">
+        <div class="abg-promos__kicker" id="promoKicker" style="display:none;">For you</div>
+        <div class="abg-promos__title" id="promoTitle">Loading…</div>
+        <div class="abg-promos__body" id="promoBody"></div>
+
+        <div class="abg-promos__ctaWrap" id="promoCtaWrap" style="display:none;">
+          <div class="abg-promos__ctaPill">DETAILS</div>
+          <div class="abg-promos__cta" id="promoCtaText"></div>
+        </div>
+      </div>
+
+      <div class="abg-promos__dots" id="promoDots"></div>
+    </section>
+  </main>
+
+  <script src="js/display.js"></script>
+</body>
+
+</html>

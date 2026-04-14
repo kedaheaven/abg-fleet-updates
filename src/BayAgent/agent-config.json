@@ -1,0 +1,47 @@
+{
+  "environmentUrl": "https://builds-apps-dev.crm.dynamics.com",
+  "tenantId": redacted,
+  "clientId": redacted,
+  "clientSecretDpapiPath": "C:\\AllBirdies\\BayAgent\\secrets\\clientsecret.dpapi",
+  "bayId": redacted,
+  "pollSeconds": 3,
+  "heartbeatSeconds": 60,
+  "heartbeatEnabled": true,
+  "postSessionThanksSeconds": 120,
+  "postSessionThanksEnabled": true,
+  "knownGoodSeconds": 60,
+  "logLevel": "DEBUG",
+  "sessionJsonPath": "C:\\AllBirdies\\SessionDisplay\\js\\session.json",
+  "launcher": {
+    "path": "C:\\Uneekor\\Launcher\\UneekorLauncher.exe",
+    "args": "",
+    "processName": "UneekorLauncher",
+    "displayRole": "control",
+    "startOnPrep": false,
+    "startOnStart": true
+  },
+  "sessionDisplay": {
+    "mode": "kiosk",
+    "displayRole": "session",
+    "url": "file:///C:/AllBirdies/SessionDisplay/current/index.html",
+    "profileDir": "C:\\AllBirdies\\SessionDisplay\\edge-profile"
+  },
+  "displayRouting": {
+    "enabled": true,
+    "roles": {
+      "control": {
+        "selector": "DISPLAY1"
+      },
+      "session": {
+        "selector": "DISPLAY2"
+      },
+      "play": {
+        "selector": "DISPLAY1"
+      }
+    }
+  },
+  "facility": {
+    "enabled": false,
+    "simulated": true
+  }
+}
