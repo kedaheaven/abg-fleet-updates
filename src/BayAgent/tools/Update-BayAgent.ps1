@@ -283,6 +283,17 @@ if ($SignAfterInstall) {
 Write-Log "Promoting SIGNED release -> current ($CurrentDir)"
 Invoke-Robo $relDir $CurrentDir @("/MIR") | Out-Null
 
+# ---- If the package ships a tools/ folder, merge into $BaseDir\tools ----
+$pkgTools = Join-Path $relDir "tools"
+if (Test-Path -LiteralPath $pkgTools) {
+  $destTools = Join-Path $BaseDir "tools"
+  Ensure-Dir $destTools
+  Write-Log "Package includes tools/ — merging into $destTools"
+  # /E = copy subdirs including empty; no /MIR to avoid deleting scripts not in the package
+  Invoke-Robo $pkgTools $destTools @("/E") | Out-Null
+  Write-Log "Tools merge complete."
+}
+
 # Request restart (watchdog/host should honor)
 if ($RequestRestart) {
   $marker = Join-Path $ControlDir "restart.host"
