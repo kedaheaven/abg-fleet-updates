@@ -2115,6 +2115,21 @@ function Start-GenericProcess($payloadObj) {
 
     if (!(Test-Path $path)) { throw "Executable not found: $path" }
 
+    # Write the agent's Dataverse token to a temp file so child scripts (e.g. Update-BayAgent.ps1)
+    # can authenticate to Dataverse file downloads without exposing the token in process arguments.
+    $leaf = ([IO.Path]::GetFileName([string]$path)).ToLowerInvariant()
+    if ($leaf -in @("powershell.exe","pwsh.exe")) {
+        try {
+            $dvTok = Get-AccessToken
+            if (-not [string]::IsNullOrWhiteSpace($dvTok)) {
+                $tokFile = Join-Path $BaseDir "control\dvtoken.tmp"
+                [IO.File]::WriteAllText($tokFile, $dvTok)
+            }
+        } catch {
+            Write-Log "WARNING: Could not write dvtoken.tmp for child process: $($_.Exception.Message)"
+        }
+    }
+
     if ([string]::IsNullOrWhiteSpace([string]$args)) {
         $p = Start-Process -FilePath $path -PassThru
     } else {

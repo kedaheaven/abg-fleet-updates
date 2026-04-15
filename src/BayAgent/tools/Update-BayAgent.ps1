@@ -15,11 +15,23 @@ B) A single top-level folder containing those files
 (Anything deeper than one folder is not recommended.)
 
 Typical usage (via StartProcess BayCommand):
-powershell.exe -NoProfile -File "C:\AllBirdies\BayAgent\tools\Update-BayAgent.ps1" `
-  -Version "1.0.1" `
-  -PackageUrl "https://github.com/<owner>/<repo>/releases/download/<tag>/BayAgent-1.0.1.zip" `
-  -Sha256 "<sha256>" `
-  -RequestRestart
+
+  GitHub (legacy):
+  powershell.exe -NoProfile -File "C:\AllBirdies\BayAgent\tools\Update-BayAgent.ps1" `
+    -Version "1.0.1" `
+    -PackageUrl "https://github.com/<owner>/<repo>/releases/download/<tag>/BayAgent-1.0.1.zip" `
+    -Sha256 "<sha256>" `
+    -RequestRestart
+
+  Dataverse (preferred):
+  powershell.exe -NoProfile -File "C:\AllBirdies\BayAgent\tools\Update-BayAgent.ps1" `
+    -Version "1.0.9" `
+    -PackageUrl "https://<org>.crm.dynamics.com/api/data/v9.2/build_fleetreleases(<id>)/build_packagefile/$value" `
+    -Sha256 "<sha256>" `
+    -RequestRestart
+
+  When PackageUrl is a Dataverse URL (.crm.dynamics.com), the script reads a Bearer
+  token from control\dvtoken.tmp (written by BayAgent before launching this script).
 
 #>
 
@@ -83,13 +95,45 @@ function Invoke-Robo([string]$src, [string]$dst, [string[]]$extraArgs) {
   return $p.ExitCode
 }
 
+function Get-DataverseToken() {
+  # BayAgent writes its current OAuth token here before launching update scripts.
+  $tokenFile = Join-Path $BaseDir "control\dvtoken.tmp"
+  if (Test-Path -LiteralPath $tokenFile) {
+    $tok = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
+    Remove-Item -LiteralPath $tokenFile -Force -ErrorAction SilentlyContinue
+    if (-not [string]::IsNullOrWhiteSpace($tok)) { return $tok }
+  }
+  return $null
+}
+
+function Test-IsDataverseUrl([string]$url) {
+  return ($url -match '\.crm\d*\.dynamics\.com/')
+}
+
 function Download-FileWithRetry([string]$url, [string]$outFile, [int]$retries) {
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+  # If the URL is a Dataverse file column endpoint, add Authorization header.
+  $headers = @{}
+  if (Test-IsDataverseUrl $url) {
+    $dvToken = Get-DataverseToken
+    if ($dvToken) {
+      $headers["Authorization"] = "Bearer $dvToken"
+      Write-Log "Dataverse URL detected — using OAuth token for download."
+    } else {
+      Write-Log "WARNING: Dataverse URL but no token found at control\dvtoken.tmp. Download may fail."
+    }
+  }
+
   $lastErr = $null
   for ($i = 1; $i -le $retries; $i++) {
     try {
       Write-Log "Downloading (attempt $i/$retries): $url"
-      Invoke-WebRequest -Uri $url -OutFile $outFile -UseBasicParsing -MaximumRedirection 10
+      if ($headers.Count -gt 0) {
+        Invoke-WebRequest -Uri $url -OutFile $outFile -UseBasicParsing -Headers $headers -MaximumRedirection 10
+      } else {
+        Invoke-WebRequest -Uri $url -OutFile $outFile -UseBasicParsing -MaximumRedirection 10
+      }
       if (-not (Test-Path -LiteralPath $outFile)) { throw "Download completed but file missing: $outFile" }
       if ((Get-Item -LiteralPath $outFile).Length -lt 100) { Write-Log "Warning: downloaded file is very small (<100 bytes). Verify URL." }
       return
