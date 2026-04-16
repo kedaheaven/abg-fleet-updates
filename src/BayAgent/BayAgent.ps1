@@ -2901,17 +2901,17 @@ $resultObj = Execute-Command -CommandType $type -PayloadJson $payload -BayLabel 
             try { $payloadForBooking = Try-ParseJson $payload } catch {}
             $bkId = if ($payloadForBooking) { Get-PropValue $payloadForBooking "bookingId" $null } else { $null }
             if (-not [string]::IsNullOrWhiteSpace([string]$bkId)) {
-                $bkStatusCode = $null
+                $bkPatchBody = $null
                 if ($type -eq $CMD_STARTSESSION) {
                     $bkMode = if ($payloadForBooking) { (Get-PropValue $payloadForBooking "mode" "").ToString().ToLowerInvariant() } else { "" }
-                    if ($bkMode -eq "start") { $bkStatusCode = 271980001 }  # In-process
+                    if ($bkMode -eq "start") { $bkPatchBody = @{ statecode = 0; statuscode = 271980001 } }  # Active / In-process
                 }
                 elseif ($type -eq $CMD_ENDSESSION) {
-                    $bkStatusCode = 271980002  # Complete
+                    $bkPatchBody = @{ statecode = 1; statuscode = 271980002 }  # Inactive / Complete
                 }
-                if ($null -ne $bkStatusCode) {
-                    Patch-Row $token "build_bookings" $bkId @{ statuscode = $bkStatusCode } "*"
-                    Write-Log "Booking $bkId status updated to $bkStatusCode" "INFO"
+                if ($null -ne $bkPatchBody) {
+                    Patch-Row $token "build_bookings" $bkId $bkPatchBody "*"
+                    Write-Log "Booking $bkId status updated to $($bkPatchBody.statuscode) (statecode=$($bkPatchBody.statecode))" "INFO"
                 }
             }
         } catch {
