@@ -32,6 +32,8 @@ Typical usage (via StartProcess BayCommand):
 
   When PackageUrl is a Dataverse URL (.crm.dynamics.com), the script reads a Bearer
   token from control\dvtoken.tmp (written by BayAgent before launching this script).
+  Dataverse file columns are downloaded via the chunked API (InitializeFileBlocksDownload
+  + DownloadBlock) because the direct $value endpoint returns 401 for S2S tokens.
 
 #>
 
@@ -110,27 +112,78 @@ function Test-IsDataverseUrl([string]$url) {
   return ($url -match '\.crm\d*\.dynamics\.com/')
 }
 
+function Download-DataverseChunked([string]$url, [string]$outFile, [string]$token) {
+  # Parse: https://<org>.crm.dynamics.com/api/data/v9.2/<entitySet>(<id>)/<fileAttr>/$value
+  if ($url -notmatch '^(https://[^/]+/api/data/v[\d.]+)/(\w+)\(([0-9a-f-]+)\)/(\w+)/\$value$') {
+    throw "Cannot parse Dataverse file URL: $url"
+  }
+  $baseApi     = $Matches[1]
+  $entitySet   = $Matches[2]
+  $recordId    = $Matches[3]
+  $fileAttr    = $Matches[4]
+  $entityName  = $entitySet.TrimEnd('s')
+  $entityIdKey = "${entityName}id"
+
+  Write-Log "Chunked download: entity=$entityName record=$recordId attr=$fileAttr"
+
+  $hdrs = @{
+    "Authorization"  = "Bearer $token"
+    "Accept"         = "application/json"
+    "Content-Type"   = "application/json"
+    "OData-MaxVersion" = "4.0"
+    "OData-Version"  = "4.0"
+  }
+
+  # Step 1: InitializeFileBlocksDownload
+  $initBody = @{
+    Target = @{
+      "@odata.type" = "Microsoft.Dynamics.CRM.$entityName"
+      $entityIdKey  = $recordId
+    }
+    FileAttributeName = $fileAttr
+  } | ConvertTo-Json -Depth 5
+
+  $initResp = Invoke-RestMethod -Uri "$baseApi/InitializeFileBlocksDownload" `
+    -Method POST -Headers $hdrs -Body $initBody
+  $fileSize  = $initResp.FileSizeInBytes
+  $contToken = $initResp.FileContinuationToken
+  Write-Log "InitializeFileBlocksDownload OK — file=$($initResp.FileName) size=$fileSize"
+
+  # Step 2: DownloadBlock (single block — fleet packages are well under 4 MB)
+  $dlBody = @{
+    Offset                = 0
+    BlockLength           = $fileSize
+    FileContinuationToken = $contToken
+  } | ConvertTo-Json -Depth 5
+
+  $dlResp = Invoke-RestMethod -Uri "$baseApi/DownloadBlock" `
+    -Method POST -Headers $hdrs -Body $dlBody
+
+  # Step 3: Decode base64 → write file
+  $bytes = [Convert]::FromBase64String($dlResp.Data)
+  [IO.File]::WriteAllBytes($outFile, $bytes)
+  Write-Log "DownloadBlock OK — wrote $($bytes.Length) bytes to $outFile"
+}
+
 function Download-FileWithRetry([string]$url, [string]$outFile, [int]$retries) {
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-  # If the URL is a Dataverse file column endpoint, add Authorization header.
-  $headers = @{}
-  if (Test-IsDataverseUrl $url) {
+  $isDv = Test-IsDataverseUrl $url
+  $dvToken = $null
+  if ($isDv) {
     $dvToken = Get-DataverseToken
-    if ($dvToken) {
-      $headers["Authorization"] = "Bearer $dvToken"
-      Write-Log "Dataverse URL detected — using OAuth token for download."
-    } else {
-      Write-Log "WARNING: Dataverse URL but no token found at control\dvtoken.tmp. Download may fail."
+    if (-not $dvToken) {
+      throw "Dataverse file download requires OAuth token in control\dvtoken.tmp"
     }
+    Write-Log "Dataverse URL detected — using chunked download API."
   }
 
   $lastErr = $null
   for ($i = 1; $i -le $retries; $i++) {
     try {
       Write-Log "Downloading (attempt $i/$retries): $url"
-      if ($headers.Count -gt 0) {
-        Invoke-WebRequest -Uri $url -OutFile $outFile -UseBasicParsing -Headers $headers -MaximumRedirection 10
+      if ($isDv) {
+        Download-DataverseChunked -url $url -outFile $outFile -token $dvToken
       } else {
         Invoke-WebRequest -Uri $url -OutFile $outFile -UseBasicParsing -MaximumRedirection 10
       }
