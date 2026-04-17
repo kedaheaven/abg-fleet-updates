@@ -33,7 +33,9 @@ Typical usage (via StartProcess BayCommand):
   When PackageUrl is a Dataverse URL (.crm.dynamics.com), the script reads a Bearer
   token from control\dvtoken.tmp (written by BayAgent before launching this script).
   Dataverse file columns are downloaded via the chunked API (InitializeFileBlocksDownload
-  + DownloadBlock) because the direct $value endpoint returns 401 for S2S tokens.
+  + DownloadBlock) with CallerObjectId impersonation because S2S tokens cannot access
+  file columns directly. The CallerObjectId (Azure AD OID of a licensed Dataverse user)
+  is read from agent-config.json or defaults to the operator account.
 
 #>
 
@@ -126,12 +128,29 @@ function Download-DataverseChunked([string]$url, [string]$outFile, [string]$toke
 
   Write-Log "Chunked download: entity=$entityName record=$recordId attr=$fileAttr"
 
+  # S2S (client_credentials) tokens cannot access file columns directly.
+  # Impersonate a licensed Dataverse user via CallerObjectId header.
+  # Reads from agent-config.json if present; falls back to default operator OID.
+  $callerOid = "f2397a22-2404-4ff7-8e30-f2447e5f607a"
+  try {
+    $cfgPath = Join-Path $BaseDir "agent-config.json"
+    if (Test-Path -LiteralPath $cfgPath) {
+      $cfg = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json
+      $cfgOid = $cfg.callerObjectId
+      if (-not [string]::IsNullOrWhiteSpace($cfgOid)) { $callerOid = $cfgOid }
+    }
+  } catch {}
+
   $hdrs = @{
     "Authorization"  = "Bearer $token"
     "Accept"         = "application/json"
     "Content-Type"   = "application/json"
     "OData-MaxVersion" = "4.0"
     "OData-Version"  = "4.0"
+  }
+  if (-not [string]::IsNullOrWhiteSpace($callerOid)) {
+    $hdrs["CallerObjectId"] = $callerOid
+    Write-Log "Using CallerObjectId for impersonation: $callerOid"
   }
 
   # Step 1: InitializeFileBlocksDownload

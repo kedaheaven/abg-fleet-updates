@@ -3,6 +3,7 @@
   "tenantId": redacted,
   "clientId": redacted,
   "clientSecretDpapiPath": "C:\\AllBirdies\\BayAgent\\secrets\\clientsecret.dpapi",
+  "callerObjectId": "f2397a22-2404-4ff7-8e30-f2447e5f607a",
   "bayId": redacted,
   "pollSeconds": 3,
   "heartbeatSeconds": 60,
