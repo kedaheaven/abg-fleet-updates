@@ -180,9 +180,9 @@ function Download-DataverseChunked([string]$url, [string]$outFile, [string]$toke
   }
   $fileSize  = $initResp.FileSizeInBytes
   $contToken = $initResp.FileContinuationToken
-  Write-Log "InitializeFileBlocksDownload OK — file=$($initResp.FileName) size=$fileSize"
+  Write-Log "InitializeFileBlocksDownload OK -- file=$($initResp.FileName) size=$fileSize"
 
-  # Step 2: DownloadBlock (single block — fleet packages are well under 4 MB)
+  # Step 2: DownloadBlock (single block -- fleet packages are well under 4 MB)
   $dlBody = @{
     Offset                = 0
     BlockLength           = $fileSize
@@ -210,7 +210,7 @@ function Download-DataverseChunked([string]$url, [string]$outFile, [string]$toke
   # Step 3: Decode base64 → write file
   $bytes = [Convert]::FromBase64String($dlResp.Data)
   [IO.File]::WriteAllBytes($outFile, $bytes)
-  Write-Log "DownloadBlock OK — wrote $($bytes.Length) bytes to $outFile"
+  Write-Log "DownloadBlock OK -- wrote $($bytes.Length) bytes to $outFile"
 }
 
 function Download-FileWithRetry([string]$url, [string]$outFile, [int]$retries) {
@@ -223,7 +223,7 @@ function Download-FileWithRetry([string]$url, [string]$outFile, [int]$retries) {
     if (-not $dvToken) {
       throw "Dataverse file download requires OAuth token in control\dvtoken.tmp"
     }
-    Write-Log "Dataverse URL detected — using chunked download API."
+    Write-Log "Dataverse URL detected -- using chunked download API."
   }
 
   $lastErr = $null
@@ -389,7 +389,7 @@ $pkgTools = Join-Path $relDir "tools"
 if (Test-Path -LiteralPath $pkgTools) {
   $destTools = Join-Path $BaseDir "tools"
   Ensure-Dir $destTools
-  Write-Log "Package includes tools/ — merging into $destTools"
+  Write-Log "Package includes tools/ -- merging into $destTools"
   # /E = copy subdirs including empty; no /MIR to avoid deleting scripts not in the package
   Invoke-Robo $pkgTools $destTools @("/E") | Out-Null
   Write-Log "Tools merge complete."
