@@ -4,6 +4,7 @@
   "clientId": redacted,
   "clientSecretDpapiPath": "C:\\AllBirdies\\BayAgent\\secrets\\clientsecret.dpapi",
   "callerObjectId": "f2397a22-2404-4ff7-8e30-f2447e5f607a",
+  "callerSystemUserId": "2eb983d2-4747-f011-877a-000d3a3bc395",
   "bayId": redacted,
   "pollSeconds": 3,
   "heartbeatSeconds": 60,

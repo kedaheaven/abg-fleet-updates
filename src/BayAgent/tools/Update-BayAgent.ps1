@@ -129,29 +129,28 @@ function Download-DataverseChunked([string]$url, [string]$outFile, [string]$toke
   Write-Log "Chunked download: entity=$entityName record=$recordId attr=$fileAttr"
 
   # S2S (client_credentials) tokens cannot access file columns directly.
-  # Impersonate a licensed Dataverse user via CallerObjectId header.
-  # Reads from agent-config.json if present; falls back to default operator OID.
-  $callerOid = "f2397a22-2404-4ff7-8e30-f2447e5f607a"
+  # Impersonate a licensed Dataverse user via MSCRMCallerID header.
+  # Reads callerSystemUserId from agent-config.json or uses default.
+  $callerSuid = "2eb983d2-4747-f011-877a-000d3a3bc395"
   try {
     $cfgPath = Join-Path $BaseDir "agent-config.json"
     if (Test-Path -LiteralPath $cfgPath) {
       $cfg = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json
-      $cfgOid = $cfg.callerObjectId
-      if (-not [string]::IsNullOrWhiteSpace($cfgOid)) { $callerOid = $cfgOid }
+      $cfgSuid = $cfg.callerSystemUserId
+      if (-not [string]::IsNullOrWhiteSpace($cfgSuid)) { $callerSuid = $cfgSuid }
     }
   } catch {}
 
   $hdrs = @{
-    "Authorization"  = "Bearer $token"
-    "Accept"         = "application/json"
-    "Content-Type"   = "application/json"
+    "Authorization"    = "Bearer $token"
+    "Accept"           = "application/json"
+    "Content-Type"     = "application/json"
     "OData-MaxVersion" = "4.0"
-    "OData-Version"  = "4.0"
+    "OData-Version"    = "4.0"
+    "MSCRMCallerID"    = $callerSuid
+    "CallerObjectId"   = "f2397a22-2404-4ff7-8e30-f2447e5f607a"
   }
-  if (-not [string]::IsNullOrWhiteSpace($callerOid)) {
-    $hdrs["CallerObjectId"] = $callerOid
-    Write-Log "Using CallerObjectId for impersonation: $callerOid"
-  }
+  Write-Log "Impersonation: MSCRMCallerID=$callerSuid CallerObjectId=f2397a22..."
 
   # Step 1: InitializeFileBlocksDownload
   $initBody = @{
@@ -162,8 +161,23 @@ function Download-DataverseChunked([string]$url, [string]$outFile, [string]$toke
     FileAttributeName = $fileAttr
   } | ConvertTo-Json -Depth 5
 
-  $initResp = Invoke-RestMethod -Uri "$baseApi/InitializeFileBlocksDownload" `
-    -Method POST -Headers $hdrs -Body $initBody
+  Write-Log "POST $baseApi/InitializeFileBlocksDownload"
+  try {
+    $initResp = Invoke-RestMethod -Uri "$baseApi/InitializeFileBlocksDownload" `
+      -Method POST -Headers $hdrs -Body $initBody
+  } catch {
+    $ex = $_.Exception
+    $statusCode = ""
+    $respBody = ""
+    if ($ex -is [System.Net.WebException] -and $null -ne $ex.Response) {
+      $statusCode = [int]$ex.Response.StatusCode
+      $sr = New-Object System.IO.StreamReader($ex.Response.GetResponseStream())
+      $respBody = $sr.ReadToEnd()
+      $sr.Close()
+    }
+    Write-Log "InitializeFileBlocksDownload FAILED: status=$statusCode body=$respBody"
+    throw
+  }
   $fileSize  = $initResp.FileSizeInBytes
   $contToken = $initResp.FileContinuationToken
   Write-Log "InitializeFileBlocksDownload OK — file=$($initResp.FileName) size=$fileSize"
@@ -175,8 +189,23 @@ function Download-DataverseChunked([string]$url, [string]$outFile, [string]$toke
     FileContinuationToken = $contToken
   } | ConvertTo-Json -Depth 5
 
-  $dlResp = Invoke-RestMethod -Uri "$baseApi/DownloadBlock" `
-    -Method POST -Headers $hdrs -Body $dlBody
+  Write-Log "POST $baseApi/DownloadBlock"
+  try {
+    $dlResp = Invoke-RestMethod -Uri "$baseApi/DownloadBlock" `
+      -Method POST -Headers $hdrs -Body $dlBody
+  } catch {
+    $ex = $_.Exception
+    $statusCode = ""
+    $respBody = ""
+    if ($ex -is [System.Net.WebException] -and $null -ne $ex.Response) {
+      $statusCode = [int]$ex.Response.StatusCode
+      $sr = New-Object System.IO.StreamReader($ex.Response.GetResponseStream())
+      $respBody = $sr.ReadToEnd()
+      $sr.Close()
+    }
+    Write-Log "DownloadBlock FAILED: status=$statusCode body=$respBody"
+    throw
+  }
 
   # Step 3: Decode base64 → write file
   $bytes = [Convert]::FromBase64String($dlResp.Data)
