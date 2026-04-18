@@ -56,7 +56,7 @@ param(
   [string]$Cfg_EnabledField = "build_enabled",
   [string]$Cfg_ScopeField = "build_scope",
   [string]$Cfg_BayLookupField = "build_bay",      # lookup logical name
-  [string]$BayEntitySet = "build_bays"
+  [string]$BayEntitySet = "build_baies"
 )
 
 Set-StrictMode -Version Latest
