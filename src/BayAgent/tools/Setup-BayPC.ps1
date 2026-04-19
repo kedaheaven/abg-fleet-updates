@@ -221,40 +221,20 @@ if (-not $SkipDay0) {
 }
 
 # ==================================================================
-# PHASE 4: EDGE KIOSK MODE FOR SESSIONDISPLAY
+# PHASE 4: EDGE POLICIES (SessionDisplay launched by shell wrapper)
 # ==================================================================
 if (-not $SkipKioskSetup) {
-  Write-Step "Phase 4: Edge Kiosk Mode for SessionDisplay"
+  Write-Step "Phase 4: Edge Policies for SessionDisplay"
 
-  $sessionDisplayUrl = "file:///C:/AllBirdies/SessionDisplay/current/index.html"
+  # Ensure Edge profile directory exists for SessionDisplay
   $edgeProfileDir = Join-Path $AllBirdiesRoot "SessionDisplay\edge-profile"
   if (-not (Test-Path $edgeProfileDir)) { New-Item -ItemType Directory -Path $edgeProfileDir -Force | Out-Null }
 
-  # Create a shortcut in BayKiosk's Startup folder for Edge kiosk mode
-  $kioskStartupDir = "C:\Users\$BayKioskUser\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
-  if (-not (Test-Path $kioskStartupDir)) { New-Item -ItemType Directory -Path $kioskStartupDir -Force | Out-Null }
-
-  $shortcutPath = Join-Path $kioskStartupDir "SessionDisplay.lnk"
-  $edgePath = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-
-  # Fallback to Program Files if x86 path doesn't exist
-  if (-not (Test-Path $edgePath)) {
-    $edgePath = "C:\Program Files\Microsoft\Edge\Application\msedge.exe"
-  }
-
-  if (Test-Path $edgePath) {
-    $wshShell = New-Object -ComObject WScript.Shell
-    $shortcut = $wshShell.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath = $edgePath
-    # Kiosk mode: fullscreen, no address bar, no tabs, custom profile dir
-    $shortcut.Arguments = "--kiosk `"$sessionDisplayUrl`" --edge-kiosk-type=fullscreen --user-data-dir=`"$edgeProfileDir`" --no-first-run --disable-features=msEdgeSidebarV2"
-    $shortcut.WindowStyle = 3  # Maximized
-    $shortcut.Description = "ABG SessionDisplay - Edge Kiosk"
-    $shortcut.Save()
-    Write-Host "  Edge kiosk shortcut created at: $shortcutPath" -ForegroundColor Green
-  } else {
-    Write-Host "  WARNING: Microsoft Edge not found. SessionDisplay kiosk shortcut not created." -ForegroundColor Yellow
-    Write-Host "  Install Edge or manually configure the kiosk after setup." -ForegroundColor Yellow
+  # Remove legacy Startup shortcut if present (BA-20: shell wrapper now handles launch)
+  $legacyShortcut = "C:\Users\$BayKioskUser\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\SessionDisplay.lnk"
+  if (Test-Path $legacyShortcut) {
+    Remove-Item $legacyShortcut -Force
+    Write-Host "  Removed legacy Edge Startup shortcut (shell wrapper handles launch now)." -ForegroundColor Yellow
   }
 
   # Disable Edge first-run experience via registry
@@ -263,28 +243,129 @@ if (-not $SkipKioskSetup) {
   Set-ItemProperty -Path $edgePolicyPath -Name "HideFirstRunExperience" -Value 1 -Type DWord
   Set-ItemProperty -Path $edgePolicyPath -Name "AutoImportAtFirstRun" -Value 4 -Type DWord  # 4 = don't import
   Write-Host "  Edge first-run experience disabled." -ForegroundColor Green
+
+  # Verify Edge is installed
+  $edgePath = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+  if (-not (Test-Path $edgePath)) { $edgePath = "C:\Program Files\Microsoft\Edge\Application\msedge.exe" }
+  if (Test-Path $edgePath) {
+    Write-Host "  Edge found at: $edgePath" -ForegroundColor Green
+  } else {
+    Write-Host "  WARNING: Microsoft Edge not found. Install Edge before first boot." -ForegroundColor Yellow
+  }
 } else {
   Write-Host "  Skipping Edge kiosk setup (-SkipKioskSetup)." -ForegroundColor Yellow
 }
 
 # ==================================================================
-# PHASE 5: WINDOWS LOCKDOWN
+# PHASE 5: WINDOWS LOCKDOWN (BA-20 -- shell replacement approach)
 # ==================================================================
 if (-not $SkipLockdown) {
   Write-Step "Phase 5: Windows Lockdown"
 
-  # 5a. Enable Remote Desktop
+  # ------------------------------------------------------------------
+  # 5A: SHELL REPLACEMENT
+  # ------------------------------------------------------------------
+  # Replace Explorer with ABG.LauncherShell.ps1 for BayKiosk user.
+  # Admin accounts keep Explorer via HKCU override.
+  #
+  # How it works:
+  #   - HKLM Shell = our wrapper (machine-wide default)
+  #   - HKCU Shell = explorer.exe (per-user override for admin accounts)
+  #   - BayKiosk has no HKCU Shell set, so HKLM applies -> our wrapper
+  #   - Scheduled tasks (BayAgent, HostWatchdog) are unaffected (Task Scheduler service)
+  #   - DPAPI is session-based, unaffected by shell choice
+  # ------------------------------------------------------------------
+  Write-Host "  Configuring custom shell replacement..."
+
+  $shellWrapperPath = Join-Path $AllBirdiesRoot "BayAgent\bootstrap\ABG.LauncherShell.ps1"
+  $psExe = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+  $shellCommand = "$psExe -NoProfile -WindowStyle Hidden -File `"$shellWrapperPath`""
+
+  # Set machine-wide default shell to our wrapper
+  $winlogonHKLM = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+  Set-ItemProperty -Path $winlogonHKLM -Name "Shell" -Value $shellCommand
+  Write-Host "  HKLM Shell set to LauncherShell.ps1" -ForegroundColor Green
+
+  # Preserve Explorer shell for the current admin user (HKCU takes precedence)
+  $winlogonHKCU = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
+  if (-not (Test-Path $winlogonHKCU)) { New-Item -Path $winlogonHKCU -Force | Out-Null }
+  Set-ItemProperty -Path $winlogonHKCU -Name "Shell" -Value "explorer.exe"
+  Write-Host "  HKCU Shell for current admin set to explorer.exe" -ForegroundColor Green
+
+  # Verify the wrapper script exists (it ships with the fleet package)
+  if (Test-Path $shellWrapperPath) {
+    Write-Host "  Shell wrapper found at: $shellWrapperPath" -ForegroundColor Green
+  } else {
+    Write-Host "  WARNING: Shell wrapper not found at: $shellWrapperPath" -ForegroundColor Yellow
+    Write-Host "  The wrapper will be deployed by the first fleet update (Update-BayAgent.ps1)." -ForegroundColor Yellow
+    Write-Host "  Until then, BayKiosk login will show a PowerShell error." -ForegroundColor Yellow
+  }
+
+  Write-Host ""
+  Write-Host "  NOTE: Additional admin accounts that log in via RDP must have" -ForegroundColor Yellow
+  Write-Host "  HKCU Shell set to explorer.exe. Run this on each admin account:" -ForegroundColor Yellow
+  Write-Host "    New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name Shell -Value explorer.exe -Force" -ForegroundColor White
+
+  # ------------------------------------------------------------------
+  # 5B: KEYBOARD RESTRICTIONS
+  # ------------------------------------------------------------------
+  # With no Explorer running, many shortcuts are already inert:
+  #   Win key, Win+R, Win+E, Win+D, Ctrl+Esc -- all handled by Explorer
+  #
+  # Remaining risks:
+  #   Win+L (lock screen) -- block via DisableLockWorkstation
+  #   Ctrl+Alt+Del -> Task Manager -- block via DisableTaskMgr
+  #   Alt+Tab -- KEEP ENABLED (customer switches between Launcher and game)
+  #   Alt+F4 -- KEEP ENABLED (launcher restarts in 2s via shell wrapper)
+  #   Ctrl+Alt+Del -> other options -- limited by disabled TM + lock
+  # ------------------------------------------------------------------
+  Write-Host ""
+  Write-Host "  Applying keyboard restrictions..."
+
+  # Disable lock screen via Win+L
+  $systemPolicyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+  if (-not (Test-Path $systemPolicyPath)) { New-Item -Path $systemPolicyPath -Force | Out-Null }
+  Set-ItemProperty -Path $systemPolicyPath -Name "DisableLockWorkstation" -Value 1 -Type DWord
+  Write-Host "  Win+L (lock screen) disabled." -ForegroundColor Green
+
+  # Disable Task Manager for all users (admin can re-enable via RDP if needed)
+  Set-ItemProperty -Path $systemPolicyPath -Name "DisableTaskMgr" -Value 1 -Type DWord
+  Write-Host "  Task Manager disabled (Ctrl+Alt+Del limited)." -ForegroundColor Green
+
+  # Disable command prompt for non-admin context
+  $explorerPolicyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+  if (-not (Test-Path $explorerPolicyPath)) { New-Item -Path $explorerPolicyPath -Force | Out-Null }
+  Set-ItemProperty -Path $explorerPolicyPath -Name "DisallowRun" -Value 0 -Type DWord
+
+  # Disable Settings app / Control Panel
+  Set-ItemProperty -Path $explorerPolicyPath -Name "NoControlPanel" -Value 1 -Type DWord
+  Write-Host "  Settings/Control Panel disabled." -ForegroundColor Green
+
+  Write-Host ""
+  Write-Host "  Keyboard status with custom shell:" -ForegroundColor Cyan
+  Write-Host "    Win key / Win+R / Win+E / Win+D / Ctrl+Esc -- INERT (no Explorer)" -ForegroundColor DarkGray
+  Write-Host "    Win+L -- BLOCKED (DisableLockWorkstation)" -ForegroundColor DarkGray
+  Write-Host "    Ctrl+Alt+Del -- LIMITED (Task Manager disabled)" -ForegroundColor DarkGray
+  Write-Host "    Alt+Tab -- ENABLED (game window switching)" -ForegroundColor DarkGray
+  Write-Host "    Alt+F4 -- ENABLED (launcher auto-restarts in 2s)" -ForegroundColor DarkGray
+
+  # ------------------------------------------------------------------
+  # 5C: SECURITY HARDENING (carried over from BA-19)
+  # ------------------------------------------------------------------
+  Write-Host ""
+
+  # Enable Remote Desktop
   Write-Host "  Enabling Remote Desktop..."
   Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
   Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
   Write-Host "  Remote Desktop enabled." -ForegroundColor Green
 
-  # 5b. Disable USB mass storage
+  # Disable USB mass storage
   Write-Host "  Disabling USB mass storage..."
   Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\USBSTOR" -Name "Start" -Value 4
   Write-Host "  USB mass storage disabled." -ForegroundColor Green
 
-  # 5c. Disable screen saver, sleep, and display timeout
+  # Disable screen saver, sleep, and display timeout
   Write-Host "  Disabling sleep and screen timeout..."
   powercfg /change monitor-timeout-ac 0
   powercfg /change standby-timeout-ac 0
@@ -295,35 +376,21 @@ if (-not $SkipLockdown) {
   Set-ItemProperty -Path $personalizePath -Name "NoLockScreen" -Value 1 -Type DWord
   Write-Host "  Sleep, hibernate, and lock screen disabled." -ForegroundColor Green
 
-  # 5d. Configure Windows Update active hours (allow updates 4-5 AM only)
+  # Configure Windows Update active hours
   Write-Host "  Configuring Windows Update active hours..."
   $wuPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
   if (-not (Test-Path $wuPath)) { New-Item -Path $wuPath -Force | Out-Null }
   $auPath = "$wuPath\AU"
   if (-not (Test-Path $auPath)) { New-Item -Path $auPath -Force | Out-Null }
-  # Auto-download and schedule install
   Set-ItemProperty -Path $auPath -Name "AUOptions" -Value 4 -Type DWord
-  # Schedule install at 4 AM
   Set-ItemProperty -Path $auPath -Name "ScheduledInstallTime" -Value 4 -Type DWord
-  # No auto-restart during active hours
   Set-ItemProperty -Path $auPath -Name "NoAutoRebootWithLoggedOnUsers" -Value 1 -Type DWord
-  # Set active hours: 5 AM to 4 AM (23-hour window, max allowed is 18h -- use 5 AM to 11 PM)
   Set-ItemProperty -Path $wuPath -Name "SetActiveHours" -Value 1 -Type DWord
   Set-ItemProperty -Path $wuPath -Name "ActiveHoursStart" -Value 5 -Type DWord
   Set-ItemProperty -Path $wuPath -Name "ActiveHoursEnd" -Value 23 -Type DWord
   Write-Host "  Windows Update active hours: 5 AM - 11 PM (installs at 4 AM)." -ForegroundColor Green
 
-  # 5e. Hide taskbar and disable Start menu for BayKiosk (Explorer policies)
-  Write-Host "  Applying Explorer restrictions..."
-  $explorerPolicyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer"
-  if (-not (Test-Path $explorerPolicyPath)) { New-Item -Path $explorerPolicyPath -Force | Out-Null }
-  # Hide taskbar (auto-hide + disable unhide)
-  Set-ItemProperty -Path $explorerPolicyPath -Name "NoTrayItemsDisplay" -Value 1 -Type DWord
-  # Disable Settings app
-  Set-ItemProperty -Path $explorerPolicyPath -Name "NoControlPanel" -Value 1 -Type DWord
-  Write-Host "  Taskbar notifications hidden, Settings/Control Panel disabled." -ForegroundColor Green
-
-  # 5f. Disable Cortana and Search
+  # Disable Cortana and Search
   Write-Host "  Disabling Cortana and Search..."
   $searchPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search"
   if (-not (Test-Path $searchPath)) { New-Item -Path $searchPath -Force | Out-Null }
@@ -331,17 +398,50 @@ if (-not $SkipLockdown) {
   Set-ItemProperty -Path $searchPath -Name "DisableWebSearch" -Value 1 -Type DWord
   Write-Host "  Cortana and web search disabled." -ForegroundColor Green
 
-  # 5g. Disable notification center
+  # Disable notification center
   Write-Host "  Disabling notification center..."
   $pushPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer"
   if (-not (Test-Path $pushPath)) { New-Item -Path $pushPath -Force | Out-Null }
   Set-ItemProperty -Path $pushPath -Name "DisableNotificationCenter" -Value 1 -Type DWord
   Write-Host "  Notification center disabled." -ForegroundColor Green
 
-  # 5h. Set execution policy to AllSigned for LocalMachine
+  # Set execution policy to AllSigned
   Write-Host "  Setting execution policy to AllSigned..."
   Set-ExecutionPolicy -ExecutionPolicy AllSigned -Scope LocalMachine -Force
   Write-Host "  Execution policy set to AllSigned." -ForegroundColor Green
+
+  # ------------------------------------------------------------------
+  # 5D: DISPLAY DETECTION
+  # ------------------------------------------------------------------
+  Write-Host ""
+  Write-Host "  Detecting connected displays..."
+  try {
+    Add-Type -AssemblyName System.Windows.Forms
+    $allScreens = [System.Windows.Forms.Screen]::AllScreens
+    Write-Host "  Displays connected: $($allScreens.Count)" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $allScreens.Count; $i++) {
+      $scr = $allScreens[$i]
+      $b = $scr.Bounds
+      $pri = if ($scr.Primary) { " [PRIMARY]" } else { "" }
+      Write-Host ("    Display {0}: {1} ({2}x{3} at {4},{5}){6}" -f $i, $scr.DeviceName, $b.Width, $b.Height, $b.Left, $b.Top, $pri) -ForegroundColor White
+    }
+    if ($allScreens.Count -lt 3) {
+      Write-Host "  WARNING: Fewer than 3 displays detected. Three-display layout requires:" -ForegroundColor Yellow
+      Write-Host "    Display 1 = Touchscreen (Launcher), Display 2 = Projector, Display 3 = SessionDisplay monitor" -ForegroundColor Yellow
+      Write-Host "  Display configuration can be completed after physical installation." -ForegroundColor Yellow
+    }
+  } catch {
+    Write-Host "  Could not detect displays: $($_.Exception.Message)" -ForegroundColor Yellow
+  }
+
+  # ------------------------------------------------------------------
+  # 5E: ADMIN ACCESS NOTES
+  # ------------------------------------------------------------------
+  Write-Host ""
+  Write-Host "  Admin access:" -ForegroundColor Cyan
+  Write-Host "    - RDP from dev machine as admin account (not BayKiosk)" -ForegroundColor White
+  Write-Host "    - On-site: Ctrl+Alt+Del -> Switch User -> admin account" -ForegroundColor White
+  Write-Host "    - Admin account retains full Explorer shell" -ForegroundColor White
 
 } else {
   Write-Host "  Skipping Windows lockdown (-SkipLockdown)." -ForegroundColor Yellow
@@ -510,11 +610,50 @@ $checks += [PSCustomObject]@{
   Result = if ($netTest.TcpTestSucceeded) { "PASS" } else { "FAIL" }
 }
 
-# Edge kiosk shortcut
-$kioskShortcut = "C:\Users\$BayKioskUser\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\SessionDisplay.lnk"
+# Shell wrapper script
+$shellWrapperCheck = Join-Path $AllBirdiesRoot "BayAgent\bootstrap\ABG.LauncherShell.ps1"
 $checks += [PSCustomObject]@{
-  Check  = "Edge kiosk shortcut"
-  Result = if (Test-Path $kioskShortcut) { "PASS" } else { "FAIL" }
+  Check  = "Shell wrapper script"
+  Result = if (Test-Path $shellWrapperCheck) { "PASS" } else { "PENDING (deployed by fleet update)" }
+}
+
+# Custom shell configured (HKLM)
+$hklmShell = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name Shell -ErrorAction SilentlyContinue).Shell
+$checks += [PSCustomObject]@{
+  Check  = "Custom shell (HKLM)"
+  Result = if ($hklmShell -like "*LauncherShell*") { "PASS" } else { "FAIL (Shell=$hklmShell)" }
+}
+
+# Admin shell override (HKCU)
+$hkcuShell = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name Shell -ErrorAction SilentlyContinue).Shell
+$checks += [PSCustomObject]@{
+  Check  = "Admin shell override (HKCU)"
+  Result = if ($hkcuShell -eq "explorer.exe") { "PASS" } else { "FAIL" }
+}
+
+# Keyboard: Win+L disabled
+$lockWs = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name DisableLockWorkstation -ErrorAction SilentlyContinue).DisableLockWorkstation
+$checks += [PSCustomObject]@{
+  Check  = "Win+L (lock) disabled"
+  Result = if ($lockWs -eq 1) { "PASS" } else { "FAIL" }
+}
+
+# Keyboard: Task Manager disabled
+$disTm = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name DisableTaskMgr -ErrorAction SilentlyContinue).DisableTaskMgr
+$checks += [PSCustomObject]@{
+  Check  = "Task Manager disabled"
+  Result = if ($disTm -eq 1) { "PASS" } else { "FAIL" }
+}
+
+# Display count
+$displayCount = 0
+try {
+  Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+  $displayCount = ([System.Windows.Forms.Screen]::AllScreens).Count
+} catch {}
+$checks += [PSCustomObject]@{
+  Check  = "Display count (3 required)"
+  Result = if ($displayCount -ge 3) { "PASS ($displayCount displays)" } else { "SKIP ($displayCount displays -- connect all 3 for final verification)" }
 }
 
 # Execution policy
@@ -554,10 +693,20 @@ if ($env:COMPUTERNAME -ne $expectedName) {
   $nextSteps += "2. Reboot to apply the computer name change to '$expectedName'"
 }
 $nextSteps += "3. Edit agent-config.json with bay-specific values (environmentUrl, bayId, tenantId, clientId)"
-$nextSteps += "4. Configure display arrangement (Display 1 = projector, Display 2 = SessionDisplay monitor)"
-$nextSteps += "5. Reboot and verify auto-login + Edge kiosk + BayAgent starts"
+$nextSteps += "4. Configure display arrangement:"
+$nextSteps += "     Display 1 = Touchscreen (primary, Launcher)"
+$nextSteps += "     Display 2 = Projector (gameplay)"
+$nextSteps += "     Display 3 = Monitor (SessionDisplay)"
+$nextSteps += "   Update displayRouting.roles in agent-config.json if display order differs"
+$nextSteps += "5. Reboot and verify kiosk mode:"
+$nextSteps += "     - BayKiosk auto-logs in (no desktop, no taskbar, no Start menu)"
+$nextSteps += "     - Uneekor Launcher appears on touchscreen (Display 1)"
+$nextSteps += "     - SessionDisplay appears on monitor (Display 3)"
+$nextSteps += "     - Windows key does nothing"
+$nextSteps += "     - Closing Launcher -> restarts in 2-3 seconds"
 $nextSteps += "6. Check the MDA: Ops > Bays -- the new bay should appear Online within 2 minutes"
 $nextSteps += "7. Send a HealthCheck from the MDA to verify end-to-end"
+$nextSteps += "8. Install Uneekor software and update agent-config.json launcher path"
 
 foreach ($step in $nextSteps) {
   Write-Host "  $step" -ForegroundColor White

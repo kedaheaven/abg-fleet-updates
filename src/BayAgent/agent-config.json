@@ -13,7 +13,7 @@
   "postSessionThanksEnabled": true,
   "knownGoodSeconds": 60,
   "logLevel": "DEBUG",
-  "sessionJsonPath": "C:\\AllBirdies\\SessionDisplay\\js\\session.json",
+  "sessionJsonPath": "C:\\AllBirdies\\SessionDisplay\\data\\session.json",
   "launcher": {
     "path": "C:\\Uneekor\\Launcher\\UneekorLauncher.exe",
     "args": "",
@@ -32,15 +32,23 @@
     "enabled": true,
     "roles": {
       "control": {
-        "selector": "DISPLAY1"
-      },
-      "session": {
-        "selector": "DISPLAY2"
+        "selector": "DISPLAY1",
+        "comment": "43-inch touchscreen -- Uneekor Launcher and game windows"
       },
       "play": {
-        "selector": "DISPLAY1"
+        "selector": "DISPLAY2",
+        "comment": "Projector -- gameplay projection, game windows can move here"
+      },
+      "session": {
+        "selector": "DISPLAY3",
+        "comment": "43-inch monitor -- SessionDisplay, locked, always visible"
       }
     }
+  },
+  "kiosk": {
+    "shell": "C:\\AllBirdies\\BayAgent\\bootstrap\\ABG.LauncherShell.ps1",
+    "allowedProcesses": ["UneekorLauncher"],
+    "comment": "allowedProcesses: populate with child exe names after Uneekor installation"
   },
   "facility": {
     "enabled": false,
