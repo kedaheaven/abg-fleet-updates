@@ -18,6 +18,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ABG-Day0-Setup.ps1 `
 Notes:
 - Uses client_credentials token scope: <EnvironmentUrl>/.default
 - Creates ConfigItem records (upsert) for thumbprint + key unique name.
+- Signs bootstrap/tools scripts (RFC 3161 timestamped) so signatures outlive the
+  signing certificate's own expiry -- see -TimeStampServer below.
 #>
 
 [CmdletBinding()]
@@ -56,7 +58,14 @@ param(
   [string]$Cfg_EnabledField = "build_enabled",
   [string]$Cfg_ScopeField = "build_scope",
   [string]$Cfg_BayLookupField = "build_bay",      # lookup logical name
-  [string]$BayEntitySet = "build_baies"
+  [string]$BayEntitySet = "build_baies",
+
+  # RFC 3161 timestamp server used when signing bootstrap/tools scripts on Day 0.
+  # A timestamped Authenticode signature stays valid after the signing certificate
+  # itself expires; an untimestamped one does not. Must be HTTP, not HTTPS --
+  # Set-AuthenticodeSignature does not support HTTPS timestamp URLs. Override only
+  # if DigiCert's responder endpoint moves or a different CA is used.
+  [string]$TimeStampServer = "http://timestamp.digicert.com"
 )
 
 Set-StrictMode -Version Latest
@@ -128,11 +137,18 @@ function Grant-Kiosk-KeyAccess([string]$uniqueName, [string]$kioskAccount) {
   icacls "$keyPath"
 }
 
-function Sign-File([string]$path, $cert) {
+function Sign-File([string]$path, $cert, [string]$timeStampServer) {
   if (-not (Test-Path -LiteralPath $path)) { throw "Cannot sign missing file: $path" }
-  Set-AuthenticodeSignature -FilePath $path -Certificate $cert | Out-Null
+  Set-AuthenticodeSignature -FilePath $path -Certificate $cert -TimeStampServer $timeStampServer | Out-Null
   $sig = Get-AuthenticodeSignature $path
   if ($sig.Status -ne "Valid") { throw "Signature invalid for $path. Status=$($sig.Status) Message=$($sig.StatusMessage)" }
+  if ($null -eq $sig.TimeStamperCertificate) {
+    # Set-AuthenticodeSignature can silently sign WITHOUT a timestamp and still report
+    # Status=Valid if the timestamp server was unreachable or rejected the request --
+    # that untimestamped signature stops validating the moment the signing cert expires.
+    # Hard-fail rather than provision a bay PC with that fault baked in from Day 0.
+    throw "Signature for $path is Valid but UNTIMESTAMPED (server: $timeStampServer). Refusing to provision with an untimestamped signature."
+  }
 }
 
 function Write-AgentConfigTemplateIfMissing([string]$path) {
@@ -351,13 +367,13 @@ Write-Host "Unique container name: $uniqueName"
 Grant-Kiosk-KeyAccess -uniqueName $uniqueName -kioskAccount $kioskAccount
 
 Write-Step "Sign bootstrap/tools scripts"
-Sign-File -path $agentHostPath     -cert $cert
-Sign-File -path $watchdogPath      -cert $cert
-Sign-File -path $updateAgentPath   -cert $cert
-Sign-File -path $updateDispPath    -cert $cert
+Sign-File -path $agentHostPath     -cert $cert -timeStampServer $TimeStampServer
+Sign-File -path $watchdogPath      -cert $cert -timeStampServer $TimeStampServer
+Sign-File -path $updateAgentPath   -cert $cert -timeStampServer $TimeStampServer
+Sign-File -path $updateDispPath    -cert $cert -timeStampServer $TimeStampServer
 
 # NEW: sign promos updater
-Sign-File -path $updatePromosPath  -cert $cert
+Sign-File -path $updatePromosPath  -cert $cert -timeStampServer $TimeStampServer
 
 Write-Host "All bootstrap/tools scripts signed and valid."
 
@@ -406,7 +422,7 @@ Write-Host '  $tp = "' + $cert.Thumbprint + '"'
 Write-Host '  $cert = Get-ChildItem "Cert:\LocalMachine\My\$tp"'
 Write-Host '  $test = "C:\AllBirdies\BayAgent\state\sign-test.ps1"'
 Write-Host '  "Write-Output ''sign test ok''" | Set-Content -Path $test -Encoding UTF8'
-Write-Host '  Set-AuthenticodeSignature -FilePath $test -Certificate $cert | Out-Null'
+Write-Host '  Set-AuthenticodeSignature -FilePath $test -Certificate $cert -TimeStampServer http://timestamp.digicert.com | Out-Null'
 Write-Host '  Get-AuthenticodeSignature $test | Format-List Status, StatusMessage'
 
 Write-Step "DONE"

@@ -1,0 +1,21 @@
+# Pin line endings for PowerShell scripts that carry embedded Authenticode signatures.
+#
+# Authenticode script signing hashes the exact byte sequence of the file at sign time.
+# Without a pin here, checkout line endings depend on each machine's `core.autocrlf`,
+# and a checkout that doesn't match what was actually signed silently turns into a
+# HashMismatch under AllSigned -- looks like tampering, isn't.
+#
+# Measured 2026-08-03, not guessed: this repo's working tree (core.autocrlf=true, no
+# prior .gitattributes) and all 7 sampled shipped release zips (BayAgent-1.1.2 through
+# 1.1.8, extracted and inspected directly) are internally consistent CRLF throughout.
+# Pinned to match what's actually in use end-to-end.
+#
+# Note: this did NOT turn out to be the cause of the 7 HashMismatch
+# staging\expand-1.1.x\tools\Update-BayAgent.ps1 files on the bay PC -- direct
+# inspection of the shipped zips showed the mismatch is a stale trailing SIG block
+# (script content edited after signing, never re-signed), not an EOL split. This pin
+# is still worth keeping: it closes off a real, independent latent risk for any future
+# signing step that spans more than one machine or checkout.
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf

@@ -9,6 +9,17 @@ Usage:
     -AgentAccount ".\BayKiosk"
 #>
 
+# DELIBERATELY NOT SIGNED (ruled 2026-08-03, do not "fix" this):
+# This is a break-glass, human-run credential-setup procedure -- never invoked from an
+# unattended path (no scheduled task, no watchdog, no BayCommand). It is launched via
+# `-ExecutionPolicy Bypass` on one explicit, admin-typed invocation, which is a
+# narrower, more deliberate gate than a machine-wide AllSigned exemption would be.
+# Requiring a valid Authenticode signature to run the tool that recovers from a
+# code-signing problem (expired cert, broken trust chain, etc.) is a chicken-and-egg
+# lockout: exactly the failure this script may need to be run to fix. Same reasoning
+# applies to ABG.RotateClientSecretDpapiAndTest.ps1, and matches ABG-Day0-Setup.ps1's
+# existing signing list, which excludes both of these scripts too.
+
 param(
     [Parameter(Mandatory=$true)][string]$OutPath,
     # Optional: the Windows account your agent runs as (for ACLs), e.g. ".\BayKiosk" or "DOMAIN\BayKiosk"

@@ -6,8 +6,9 @@ What it does:
 1) Creates/updates a release folder under:   C:\AllBirdies\BayAgent\releases\<Version>\
 2) Optionally copies files from a staging folder into the release folder
 3) Writes/updates manifest.json (version + releasedUtc)
-4) Signs all *.ps1 in the release folder with the specified Code Signing certificate
-5) Verifies signatures are Valid
+4) Signs all *.ps1 in the release folder with the specified Code Signing certificate,
+   RFC 3161 timestamped so the signature outlives the certificate's own expiry
+5) Verifies signatures are Valid AND timestamped
 6) Switches C:\AllBirdies\BayAgent\current junction to the new release folder
 7) Optionally restarts AgentHost/BayAgent via scheduled tasks (preferred)
 
@@ -19,7 +20,7 @@ Usage examples (run in elevated PowerShell):
   # 1) Save script to disk, unblock, sign, then run:
   Unblock-File C:\AllBirdies\BayAgent\bootstrap\ABG.ReleaseFinalize.ps1
   $cert = Get-Item Cert:\CurrentUser\My\<thumbprint>
-  Set-AuthenticodeSignature C:\AllBirdies\BayAgent\bootstrap\ABG.ReleaseFinalize.ps1 -Certificate $cert
+  Set-AuthenticodeSignature C:\AllBirdies\BayAgent\bootstrap\ABG.ReleaseFinalize.ps1 -Certificate $cert -TimeStampServer http://timestamp.digicert.com
 
   # 2) Finalize a release folder you already prepared:
   .\ABG.ReleaseFinalize.ps1 -Version "1.4.3-step7.1" -CertThumbprint "<thumbprint>" -Restart
@@ -52,7 +53,14 @@ param(
     [switch]$HealthCheck,
 
     # Override UTC timestamp written to manifest (ISO 8601 Z). Default = now.
-    [string]$ReleasedUtc = ""
+    [string]$ReleasedUtc = "",
+
+    # RFC 3161 timestamp server used when signing every *.ps1 in the release folder.
+    # A timestamped Authenticode signature stays valid after the signing certificate
+    # itself expires; an untimestamped one does not. Must be HTTP, not HTTPS --
+    # Set-AuthenticodeSignature does not support HTTPS timestamp URLs. Override only
+    # if DigiCert's responder endpoint moves or a different CA is used.
+    [string]$TimeStampServer = "http://timestamp.digicert.com"
 )
 
 Set-StrictMode -Version Latest
@@ -133,17 +141,25 @@ function Copy-ReleaseFiles([string]$src, [string]$dst) {
     }
 }
 
-function Sign-Files([System.Security.Cryptography.X509Certificates.X509Certificate2]$cert, [string]$dir) {
+function Sign-Files([System.Security.Cryptography.X509Certificates.X509Certificate2]$cert, [string]$dir, [string]$timeStampServer) {
     $files = @(Get-ChildItem -Path $dir -Recurse -File -Filter *.ps1)
     if ($files.Count -eq 0) { Fail "No .ps1 files found in release folder to sign: $dir" }
 
-    Log ("Signing {0} script(s) in {1}" -f $files.Count, $dir) "INFO"
+    Log ("Signing {0} script(s) in {1} (timestamp server: {2})" -f $files.Count, $dir, $timeStampServer) "INFO"
 
     foreach ($f in $files) {
-        $sig = Set-AuthenticodeSignature -FilePath $f.FullName -Certificate $cert
+        $sig = Set-AuthenticodeSignature -FilePath $f.FullName -Certificate $cert -TimeStampServer $timeStampServer
         if ($sig.Status -ne "Valid") {
             Log ("Signature not valid for {0}. Status={1} Message={2}" -f $f.FullName, $sig.Status, $sig.StatusMessage) "ERROR"
             Fail "Signing failed for $($f.FullName)"
+        }
+        if ($null -eq $sig.TimeStamperCertificate) {
+            # Set-AuthenticodeSignature can silently sign WITHOUT a timestamp and still
+            # report Status=Valid if the timestamp server was unreachable or rejected the
+            # request -- that untimestamped signature stops validating the moment the
+            # signing cert expires. Refuse to ship it rather than fail silently.
+            Log ("Signature for {0} is Valid but UNTIMESTAMPED (server: {1}). Refusing to ship an untimestamped release." -f $f.FullName, $timeStampServer) "ERROR"
+            Fail "Timestamping failed for $($f.FullName) -- signature would stop validating when the signing certificate expires."
         }
     }
 }
@@ -156,8 +172,12 @@ function Verify-Signatures([string]$dir) {
             Log ("INVALID signature: {0}. Status={1} Message={2}" -f $f.FullName, $sig.Status, $sig.StatusMessage) "ERROR"
             Fail "Signature verification failed for $($f.FullName)"
         }
+        if ($null -eq $sig.TimeStamperCertificate) {
+            Log ("UNTIMESTAMPED signature: {0}. Valid today, but will stop validating once the signing certificate expires." -f $f.FullName) "ERROR"
+            Fail "Timestamp verification failed for $($f.FullName)"
+        }
     }
-    Log "All signatures verified as Valid." "INFO"
+    Log "All signatures verified as Valid and timestamped." "INFO"
 }
 
 function Switch-CurrentJunction([string]$baseDir, [string]$releaseDir) {
@@ -240,7 +260,7 @@ Log "Wrote manifest: $manifestPath (version=$Version releasedUtc=$releasedUtcIso
 
 # Sign & verify
 $cert = Get-CodeSigningCert -thumb $CertThumbprint
-Sign-Files -cert $cert -dir $releaseDir
+Sign-Files -cert $cert -dir $releaseDir -timeStampServer $TimeStampServer
 Verify-Signatures -dir $releaseDir
 
 # Switch current to release

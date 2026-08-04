@@ -6,7 +6,8 @@ Purpose
 - Verify SHA256
 - Expand into:   C:\AllBirdies\BayAgent\releases\<version>\
 - Promote into:  C:\AllBirdies\BayAgent\current\
-- Sign installed scripts (BayAgent.ps1 and any .ps1/.psm1/.psd1 in current) to satisfy AllSigned
+- Sign installed scripts (BayAgent.ps1 and any .ps1/.psm1/.psd1 in current) to satisfy AllSigned,
+  RFC 3161 timestamped so the signature outlives the signing certificate's own expiry
 - Optionally request restart by writing: C:\AllBirdies\BayAgent\control\restart.host
 
 ZIP structure supported:
@@ -64,7 +65,14 @@ param(
   [string]$LogPath = "C:\AllBirdies\BayAgent\logs\Update-BayAgent.log",
 
   # Download retry count
-  [int]$DownloadRetries = 3
+  [int]$DownloadRetries = 3,
+
+  # RFC 3161 timestamp server used when signing installed scripts. A timestamped
+  # Authenticode signature stays valid after the signing certificate itself expires;
+  # an untimestamped one does not. Must be HTTP, not HTTPS -- Set-AuthenticodeSignature
+  # does not support HTTPS timestamp URLs. Override only if DigiCert's responder
+  # endpoint moves or a different CA is used.
+  [string]$TimeStampServer = "http://timestamp.digicert.com"
 )
 
 Set-StrictMode -Version Latest
@@ -272,17 +280,24 @@ function Get-CodeSigningCert() {
   return ($cands | Sort-Object NotAfter -Descending | Select-Object -First 1)
 }
 
-function Sign-File([string]$path, $cert) {
+function Sign-File([string]$path, $cert, [string]$timeStampServer) {
   if (-not (Test-Path -LiteralPath $path)) { return $false }
   $ext = [IO.Path]::GetExtension($path).ToLowerInvariant()
   if ($ext -notin @(".ps1", ".psm1", ".psd1")) { return $false }
 
   # Signing modifies file content: do it only after all copying is complete.
-  Set-AuthenticodeSignature -FilePath $path -Certificate $cert | Out-Null
+  Set-AuthenticodeSignature -FilePath $path -Certificate $cert -TimeStampServer $timeStampServer | Out-Null
   $sig = Get-AuthenticodeSignature -FilePath $path
 
   if ($sig.Status -ne "Valid") {
     throw "Signature invalid for $path. Status=$($sig.Status) Message=$($sig.StatusMessage)"
+  }
+  if ($null -eq $sig.TimeStamperCertificate) {
+    # Set-AuthenticodeSignature can silently sign WITHOUT a timestamp and still report
+    # Status=Valid if the timestamp server was unreachable or rejected the request --
+    # that untimestamped signature stops validating the moment the signing cert expires.
+    # Hard-fail rather than ship that silently.
+    throw "Signature for $path is Valid but UNTIMESTAMPED (server: $timeStampServer). Refusing to ship an untimestamped release -- it would stop validating when the signing certificate expires."
   }
 
   return $true
@@ -291,7 +306,7 @@ function Sign-File([string]$path, $cert) {
 # ------------------ MAIN ------------------
 
 Write-Log "----"
-Write-Log "Starting update. Version=$Version Url=$PackageUrl BaseDir=$BaseDir SignAfterInstall=$([bool]$SignAfterInstall) RequestRestart=$([bool]$RequestRestart)"
+Write-Log "Starting update. Version=$Version Url=$PackageUrl BaseDir=$BaseDir SignAfterInstall=$([bool]$SignAfterInstall) TimeStampServer=$TimeStampServer RequestRestart=$([bool]$RequestRestart)"
 
 # Standard folders
 $StagingDir  = Join-Path $BaseDir "staging"
@@ -360,7 +375,7 @@ if ($SignAfterInstall) {
   $relAgentPath = Join-Path $relDir "BayAgent.ps1"
   if (-not (Test-Path $relAgentPath)) { throw "Release missing BayAgent.ps1: $relAgentPath" }
 
-  if (Sign-File -path $relAgentPath -cert $cert) { $signCount++ }
+  if (Sign-File -path $relAgentPath -cert $cert -timeStampServer $TimeStampServer) { $signCount++ }
 
   # Sign any shipped modules/scripts in the release folder too
   $toSign = @(Get-ChildItem -LiteralPath $relDir -Recurse -File |
@@ -368,13 +383,16 @@ if ($SignAfterInstall) {
 
   foreach ($f in $toSign) {
     if ($f.FullName -ieq $relAgentPath) { continue }
-    if (Sign-File -path $f.FullName -cert $cert) { $signCount++ }
+    if (Sign-File -path $f.FullName -cert $cert -timeStampServer $TimeStampServer) { $signCount++ }
   }
 
-  # Verify the release agent signature is Valid before touching current
+  # Verify the release agent signature is Valid AND timestamped before touching current
   $sig = Get-AuthenticodeSignature -FilePath $relAgentPath
   if ($sig.Status -ne "Valid") {
     throw "Release BayAgent.ps1 signature invalid ($($sig.Status)): $($sig.StatusMessage)"
+  }
+  if ($null -eq $sig.TimeStamperCertificate) {
+    throw "Release BayAgent.ps1 signature is Valid but UNTIMESTAMPED. Refusing to promote to current."
   }
 
   Write-Log "Signing complete in release folder. SignedFiles=$signCount"
