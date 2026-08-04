@@ -153,7 +153,7 @@ body {
 
 .abg-session__name {
   font-size: 54px;
-  font-weight: 1100;
+  font-weight: 1000;
   letter-spacing: -.015em;
   margin-bottom: 12px
 }
@@ -218,7 +218,7 @@ body {
 
 .abg-session__countdown {
   font-size: 132px;
-  font-weight: 1200;
+  font-weight: 1000;
   letter-spacing: -.03em;
   line-height: 1
 }
@@ -227,7 +227,7 @@ body {
   margin-top: 12px;
   min-height: 34px;
   font-size: 38px;
-  font-weight: 1100;
+  font-weight: 1000;
   color: var(--abg-green)
 }
 
@@ -318,7 +318,7 @@ body {
 
 .abg-help__title {
   font-size: 16px;
-  font-weight: 1200
+  font-weight: 1000
 }
 
 .abg-help__subtitle {
@@ -415,7 +415,7 @@ body {
 .abg-promos__label {
   font-size: 12px;
   letter-spacing: .18em;
-  font-weight: 1200;
+  font-weight: 1000;
   opacity: .8
 }
 
@@ -436,7 +436,7 @@ body {
 
 .abg-promos__kicker {
   font-size: 12px;
-  font-weight: 1100;
+  font-weight: 1000;
   letter-spacing: .12em;
   text-transform: uppercase;
   color: rgba(255, 255, 255, .78);
@@ -445,7 +445,7 @@ body {
 
 .abg-promos__title {
   font-size: 32px;
-  font-weight: 1200;
+  font-weight: 1000;
   letter-spacing: -.01em
 }
 
@@ -468,7 +468,7 @@ body {
 
 .abg-promos__ctaPill {
   font-size: 12px;
-  font-weight: 1200;
+  font-weight: 1000;
   letter-spacing: .12em;
   text-transform: uppercase;
   padding: 6px 10px;
@@ -508,7 +508,7 @@ body {
 
 .abg-promos__qrCaption {
   font-size: 11px;
-  font-weight: 1100;
+  font-weight: 1000;
   letter-spacing: .18em;
   text-transform: uppercase;
   opacity: .9;
@@ -655,6 +655,44 @@ body {
 .abg-pill.is-ending {
   background: rgba(255, 215, 0, .08);
   border-color: rgba(255, 215, 0, .22);
+}
+
+
+/* ===== EMERGENCY STOP =====
+   BayAgent writes status "STOP"; display.js had no case for it, so the pill
+   fell through to the default GREEN dot and an emergency stop signalled "go".
+   Reuses the existing gold treatment - no new palette value. */
+.abg-pill.is-stopped {
+  background: rgba(255, 215, 0, .10);
+  border-color: rgba(255, 215, 0, .30);
+}
+
+.abg-pill.is-stopped::before {
+  background: var(--abg-gold);
+  box-shadow: 0 0 0 3px rgba(255, 215, 0, .18);
+}
+
+.abg-session.is-stopped:before {
+  opacity: 1;
+  background: linear-gradient(90deg, rgba(255, 215, 0, 0), rgba(255, 215, 0, .95), rgba(255, 115, 0, .55), rgba(255, 215, 0, 0));
+}
+
+.abg-session.is-stopped .abg-session__detail {
+  color: var(--abg-gold);
+}
+
+/* a stopped session is not progressing; the bar was still filling normally */
+.abg-session.is-stopped .abg-progress {
+  display: none;
+}
+
+/* a fault state carries no advertising */
+.abg-grid.is-faulted {
+  grid-template-columns: 1fr;
+}
+
+.abg-grid.is-faulted .abg-promos {
+  display: none;
 }
 
 

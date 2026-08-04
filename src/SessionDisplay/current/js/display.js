@@ -59,7 +59,7 @@
     timing: null,
     customer: null,
     updatedUtc: null,
-    showDebug: true,
+    showDebug: false,
     _source: "",
   };
 
@@ -266,7 +266,10 @@
 
     lastEligibilityKey = key;
     eligiblePromos = (promos || []).filter(p => promoEligible(p, ctx));
-    if (!eligiblePromos.length) eligiblePromos = (promos || []).slice(0, 1);
+    // Do NOT fall back to promos[0] when nothing is eligible: that bypassed
+    // targeting entirely, and promos[0] is "Become a Member", targeted at
+    // NON-members - so a paying member could be pitched a membership.
+    // An empty list renders the untargeted house card in renderPromo().
     promoIndex = 0;
     lastPromoSwapAt = 0;
     renderPromo(true);
@@ -363,6 +366,11 @@
         if (qrImgUrl) {
           ui.promoQrWrap.style.display = "";
           ui.promoQrCaption.textContent = caption;
+          // Promo QRs are fetched from a third-party generator at runtime. On an
+          // unmanned bay a failed fetch left a broken-image icon on a 43in screen;
+          // hide the block instead. The real fix is pre-generating them into the
+          // package, which needs a package build.
+          ui.promoQrImg.onerror = function () { ui.promoQrWrap.style.display = "none"; };
           ui.promoQrImg.src = qrImgUrl;
           ui.promoQrImg.alt = p.ctaText ? `Scan for ${p.ctaText}` : "Scan for details";
         } else {
@@ -408,10 +416,11 @@
   }
 
   function setStatusPillClass(status) {
-    ui.statusPill.classList.remove("is-prep", "is-ending", "is-ended");
+    ui.statusPill.classList.remove("is-prep", "is-ending", "is-ended", "is-stopped");
     if (status === "PREP") ui.statusPill.classList.add("is-prep");
     else if (status === "ENDING") ui.statusPill.classList.add("is-ending");
     else if (status === "ENDED") ui.statusPill.classList.add("is-ended");
+    else if (status === "STOP") ui.statusPill.classList.add("is-stopped");
   }
 
   function render() {
@@ -426,7 +435,12 @@
     const sessionCard = document.querySelector('.abg-session');
     if (sessionCard) {
       sessionCard.classList.toggle('is-ending', st === 'ENDING');
+      sessionCard.classList.toggle('is-stopped', st === 'STOP');
     }
+
+    // An emergency stop must not sit next to a membership pitch.
+    const grid = document.querySelector('.abg-grid');
+    if (grid) grid.classList.toggle('is-faulted', st === 'STOP');
 
 
     const name = normalizeDisplayName(state);
@@ -447,7 +461,7 @@
     ui.memberPill.style.display = isMember ? "" : "none";
     if (isMember) ui.memberPill.textContent = "Member";
 
-    const tier = pick(cust.membership || {}, "tier");
+    const tier = pick(cust.membership || {}, "planName", "tier");
     ui.tierPill.style.display = tier ? "" : "none";
     if (tier) ui.tierPill.textContent = tier;
 

@@ -2771,16 +2771,22 @@ $CMD_EMERGENCY_STOP {
                 $stop = Stop-SessionDisplay
             }
 
-            $now = (Get-Date).ToUniversalTime().ToString("o")
             $default = @{
                 locationLabel = $effectiveBayLabel
                 displayName = "Guest"
                 status = "READY"
-                sessionStartUtc = $now
-                sessionEndUtc = $now
                 qrUrl = ""
                 helpText = "Scan the QR code for help."
             }
+
+            # No session is running, so carry NO session times. Writing
+            # sessionStartUtc = sessionEndUtc = now made the idle screen print
+            # START and END as the same minute, and left a stale zero-length
+            # window for the next partial UpdateSessionDisplay to merge over.
+            # Normalize-SessionModel also stamps schema + updatedUtc, which a
+            # bare Write-SessionFiles did not - so an idle bay could not be
+            # checked for staleness and the display printed "Updated: --".
+            $default = Normalize-SessionModel $default
 
             $paths = Write-SessionFiles $default
 
