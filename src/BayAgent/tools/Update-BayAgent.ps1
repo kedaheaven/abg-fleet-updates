@@ -17,26 +17,31 @@ B) A single top-level folder containing those files
 
 Typical usage (via StartProcess BayCommand):
 
-  GitHub (legacy):
   powershell.exe -NoProfile -File "C:\AllBirdies\BayAgent\tools\Update-BayAgent.ps1" `
-    -Version "1.0.1" `
-    -PackageUrl "https://github.com/<owner>/<repo>/releases/download/<tag>/BayAgent-1.0.1.zip" `
+    -Version "1.1.8" `
+    -PackageUrl "https://github.com/<owner>/<repo>/releases/download/<tag>/BayAgent-1.1.8.zip" `
     -Sha256 "<sha256>" `
     -RequestRestart
 
-  Dataverse (preferred):
-  powershell.exe -NoProfile -File "C:\AllBirdies\BayAgent\tools\Update-BayAgent.ps1" `
-    -Version "1.0.9" `
-    -PackageUrl "https://<org>.crm.dynamics.com/api/data/v9.2/build_fleetreleases(<id>)/build_packagefile/$value" `
-    -Sha256 "<sha256>" `
-    -RequestRestart
+PACKAGE HOSTING -- GitHub Releases, no authentication
+  PackageUrl must be an HTTPS URL that needs no credentials. All three fleet packages
+  (BayAgent, SessionDisplay, PromosPack) are hosted as GitHub Release assets and are
+  fetched with a plain Invoke-WebRequest, exactly as Update-SessionDisplay.ps1 and
+  Update-PromosPack.ps1 have always done.
 
-  When PackageUrl is a Dataverse URL (.crm.dynamics.com), the script reads a Bearer
-  token from control\dvtoken.tmp (written by BayAgent before launching this script).
-  Dataverse file columns are downloaded via the chunked API (InitializeFileBlocksDownload
-  + DownloadBlock) with CallerObjectId impersonation because S2S tokens cannot access
-  file columns directly. The CallerObjectId (Azure AD OID of a licensed Dataverse user)
-  is read from agent-config.json or defaults to the operator account.
+  Dataverse file-column hosting is RETIRED. It required a Bearer token handed over in
+  control\dvtoken.tmp plus MSCRMCallerID / CallerObjectId impersonation headers, because
+  an S2S (client_credentials) token cannot read a file column directly. That in turn
+  forced prvActOnBehalfOfAnotherUser at GLOBAL scope onto the ABG Bay AGent role -- a
+  standing privilege to act as any user in the org, held by an unattended kiosk PC, for
+  the sole purpose of fetching a zip. Moving the package to GitHub removes the need for
+  the token, the impersonation headers and the privilege.
+
+INTEGRITY IS UNCHANGED BY THIS MOVE
+  What protects the fleet is the SHA256 check below plus the Authenticode signing pass
+  that follows it -- not the transport. The package bytes are identical whichever host
+  serves them, so the expected hash does not change when hosting moves. A tampered or
+  truncated download fails the hash and the script throws before anything is staged.
 
 #>
 
@@ -107,142 +112,51 @@ function Invoke-Robo([string]$src, [string]$dst, [string[]]$extraArgs) {
   return $p.ExitCode
 }
 
-function Get-DataverseToken() {
-  # BayAgent writes its current OAuth token here before launching update scripts.
+function Clear-StaleDataverseToken() {
+  # BayAgent writes its live OAuth bearer token to control\dvtoken.tmp before launching
+  # ANY powershell.exe StartProcess child, not just this one. Nothing else on the machine
+  # deletes it. Downloads no longer need that token, so shred it on every run rather than
+  # leaving a usable Dataverse credential sitting in plaintext on an unattended kiosk.
+  # This is a strict improvement on the previous behaviour, which only deleted the file
+  # when the package URL happened to be a Dataverse URL -- a GitHub-hosted update already
+  # left it behind indefinitely.
   $tokenFile = Join-Path $BaseDir "control\dvtoken.tmp"
-  if (Test-Path -LiteralPath $tokenFile) {
-    $tok = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
-    Remove-Item -LiteralPath $tokenFile -Force -ErrorAction SilentlyContinue
-    if (-not [string]::IsNullOrWhiteSpace($tok)) { return $tok }
+  try {
+    if (Test-Path -LiteralPath $tokenFile) {
+      Remove-Item -LiteralPath $tokenFile -Force -ErrorAction Stop
+      Write-Log "Removed stale control\dvtoken.tmp (downloads no longer use a Dataverse token)."
+    }
+  } catch {
+    Write-Log "WARNING: could not remove control\dvtoken.tmp: $($_.Exception.Message)"
   }
-  return $null
 }
 
 function Test-IsDataverseUrl([string]$url) {
   return ($url -match '\.crm\d*\.dynamics\.com/')
 }
 
-function Download-DataverseChunked([string]$url, [string]$outFile, [string]$token) {
-  # Parse: https://<org>.crm.dynamics.com/api/data/v9.2/<entitySet>(<id>)/<fileAttr>/$value
-  if ($url -notmatch '^(https://[^/]+/api/data/v[\d.]+)/(\w+)\(([0-9a-f-]+)\)/(\w+)/\$value$') {
-    throw "Cannot parse Dataverse file URL: $url"
-  }
-  $baseApi     = $Matches[1]
-  $entitySet   = $Matches[2]
-  $recordId    = $Matches[3]
-  $fileAttr    = $Matches[4]
-  $entityName  = $entitySet.TrimEnd('s')
-  $entityIdKey = "${entityName}id"
-
-  Write-Log "Chunked download: entity=$entityName record=$recordId attr=$fileAttr"
-
-  # S2S (client_credentials) tokens cannot access file columns directly.
-  # Impersonate a licensed Dataverse user via MSCRMCallerID header.
-  # Reads callerSystemUserId from agent-config.json or uses default.
-  $callerSuid = "2eb983d2-4747-f011-877a-000d3a3bc395"
-  try {
-    $cfgPath = Join-Path $BaseDir "agent-config.json"
-    if (Test-Path -LiteralPath $cfgPath) {
-      $cfg = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json
-      $cfgSuid = $cfg.callerSystemUserId
-      if (-not [string]::IsNullOrWhiteSpace($cfgSuid)) { $callerSuid = $cfgSuid }
-    }
-  } catch {}
-
-  $hdrs = @{
-    "Authorization"    = "Bearer $token"
-    "Accept"           = "application/json"
-    "Content-Type"     = "application/json"
-    "OData-MaxVersion" = "4.0"
-    "OData-Version"    = "4.0"
-    "MSCRMCallerID"    = $callerSuid
-    "CallerObjectId"   = "f2397a22-2404-4ff7-8e30-f2447e5f607a"
-  }
-  Write-Log "Impersonation: MSCRMCallerID=$callerSuid CallerObjectId=f2397a22..."
-
-  # Step 1: InitializeFileBlocksDownload
-  $initBody = @{
-    Target = @{
-      "@odata.type" = "Microsoft.Dynamics.CRM.$entityName"
-      $entityIdKey  = $recordId
-    }
-    FileAttributeName = $fileAttr
-  } | ConvertTo-Json -Depth 5
-
-  Write-Log "POST $baseApi/InitializeFileBlocksDownload"
-  try {
-    $initResp = Invoke-RestMethod -Uri "$baseApi/InitializeFileBlocksDownload" `
-      -Method POST -Headers $hdrs -Body $initBody
-  } catch {
-    $ex = $_.Exception
-    $statusCode = ""
-    $respBody = ""
-    if ($ex -is [System.Net.WebException] -and $null -ne $ex.Response) {
-      $statusCode = [int]$ex.Response.StatusCode
-      $sr = New-Object System.IO.StreamReader($ex.Response.GetResponseStream())
-      $respBody = $sr.ReadToEnd()
-      $sr.Close()
-    }
-    Write-Log "InitializeFileBlocksDownload FAILED: status=$statusCode body=$respBody"
-    throw
-  }
-  $fileSize  = $initResp.FileSizeInBytes
-  $contToken = $initResp.FileContinuationToken
-  Write-Log "InitializeFileBlocksDownload OK -- file=$($initResp.FileName) size=$fileSize"
-
-  # Step 2: DownloadBlock (single block -- fleet packages are well under 4 MB)
-  $dlBody = @{
-    Offset                = 0
-    BlockLength           = $fileSize
-    FileContinuationToken = $contToken
-  } | ConvertTo-Json -Depth 5
-
-  Write-Log "POST $baseApi/DownloadBlock"
-  try {
-    $dlResp = Invoke-RestMethod -Uri "$baseApi/DownloadBlock" `
-      -Method POST -Headers $hdrs -Body $dlBody
-  } catch {
-    $ex = $_.Exception
-    $statusCode = ""
-    $respBody = ""
-    if ($ex -is [System.Net.WebException] -and $null -ne $ex.Response) {
-      $statusCode = [int]$ex.Response.StatusCode
-      $sr = New-Object System.IO.StreamReader($ex.Response.GetResponseStream())
-      $respBody = $sr.ReadToEnd()
-      $sr.Close()
-    }
-    Write-Log "DownloadBlock FAILED: status=$statusCode body=$respBody"
-    throw
-  }
-
-  # Step 3: Decode base64 → write file
-  $bytes = [Convert]::FromBase64String($dlResp.Data)
-  [IO.File]::WriteAllBytes($outFile, $bytes)
-  Write-Log "DownloadBlock OK -- wrote $($bytes.Length) bytes to $outFile"
-}
-
 function Download-FileWithRetry([string]$url, [string]$outFile, [int]$retries) {
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-  $isDv = Test-IsDataverseUrl $url
-  $dvToken = $null
-  if ($isDv) {
-    $dvToken = Get-DataverseToken
-    if (-not $dvToken) {
-      throw "Dataverse file download requires OAuth token in control\dvtoken.tmp"
-    }
-    Write-Log "Dataverse URL detected -- using chunked download API."
+  # Dataverse file-column hosting is retired -- refuse it loudly rather than attempting a
+  # fetch that can only ever 401. An S2S token cannot read a file column without
+  # impersonation headers, and this script no longer sends them by design. Failing here
+  # with an explanation beats three silent retries and a generic timeout.
+  if (Test-IsDataverseUrl $url) {
+    # NOTE the parentheses around the concatenation: "a" + "b" -f $x parses as "a" + ("b" -f $x),
+    # which silently drops the placeholder and prints a URL-less message on an unmanned machine.
+    $msg = ("PackageUrl points at Dataverse ({0}). Dataverse file-column hosting is retired: " +
+            "this script no longer impersonates a user to read file columns. Publish the package " +
+            "as a GitHub Release asset and set the Fleet.BayAgent.PackageUrl ConfigItem to that " +
+            "URL -- the SHA256 does not change, because the package bytes do not change.")
+    throw ($msg -f $url)
   }
 
   $lastErr = $null
   for ($i = 1; $i -le $retries; $i++) {
     try {
       Write-Log "Downloading (attempt $i/$retries): $url"
-      if ($isDv) {
-        Download-DataverseChunked -url $url -outFile $outFile -token $dvToken
-      } else {
-        Invoke-WebRequest -Uri $url -OutFile $outFile -UseBasicParsing -MaximumRedirection 10
-      }
+      Invoke-WebRequest -Uri $url -OutFile $outFile -UseBasicParsing -MaximumRedirection 10
       if (-not (Test-Path -LiteralPath $outFile)) { throw "Download completed but file missing: $outFile" }
       if ((Get-Item -LiteralPath $outFile).Length -lt 100) { Write-Log "Warning: downloaded file is very small (<100 bytes). Verify URL." }
       return
@@ -319,6 +233,9 @@ Ensure-Dir $StagingDir
 Ensure-Dir $ReleasesDir
 Ensure-Dir $CurrentDir
 Ensure-Dir $ControlDir
+
+# Downloads are unauthenticated now; shred any bearer token BayAgent left for us.
+Clear-StaleDataverseToken
 
 # Paths for this version
 $zipPath   = Join-Path $StagingDir ("BayAgent-{0}.zip" -f $Version)
@@ -423,38 +340,3 @@ if ($RequestRestart) {
 
 Write-Log "Update complete OK. Version=$Version"
 Write-Output ("OK: Updated BayAgent to {0}. ReleaseDir={1}. CurrentDir={2}. SignedFiles={3}. RestartRequested={4}" -f $Version, $relDir, $CurrentDir, $signCount, [bool]$RequestRestart)
-
-
-
-# SIG # Begin signature block
-# MIIFiwYJKoZIhvcNAQcCoIIFfDCCBXgCAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
-# gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
-# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUuIFlpkMU7GCwiSDe84tPjR9t
-# K16gggMcMIIDGDCCAgCgAwIBAgIQcB7+YhwgR7ZJib3KL4WIcjANBgkqhkiG9w0B
-# AQsFADAkMSIwIAYDVQQDDBlBQkcgQmF5QWdlbnQgQ29kZSBTaWduaW5nMB4XDTI2
-# MDEwMzExMjAyNloXDTI3MDEwMzExNDAyNlowJDEiMCAGA1UEAwwZQUJHIEJheUFn
-# ZW50IENvZGUgU2lnbmluZzCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB
-# AMHHQzWuIzBHO6BwscGzuoCN3bquhA+YTha7xYBsvX/eatjwlCpT4buJXeVZvoHQ
-# OOcMsKg+kt+taj9s/gv2Arm0rh730JVHtJcSm0X96L+GI29bjydtSFqLl8iAtCvh
-# 1EQoakIaxXTVGXKxMNEnhNwIocdDETF1wT1kkZ/bCDZyPY5Y0/iEcRc5CAKAhF/H
-# IrIJXd/QL4esRkg1HkmDCOoHD3vZkQAWLgTLchRFE6Uk10RAHwJmpHBWo/pjho0L
-# tGNFDRJvgXGpO6hbSSjxu5gyznnDWd2chg/xW6WLJ3dhqFpYIixOR+gBJumVS46F
-# 8jFj+hT8MfWxzhpX3NtQf2ECAwEAAaNGMEQwDgYDVR0PAQH/BAQDAgeAMBMGA1Ud
-# JQQMMAoGCCsGAQUFBwMDMB0GA1UdDgQWBBTlEn8ZOjY/C0/ILYEj+knQETbTMzAN
-# BgkqhkiG9w0BAQsFAAOCAQEATPNqtG54FSKaVvJ/XtuHqccWzTJ3koMG6gq+jlLE
-# OiOhQ7auwTNPRy42er59N79LInazh5pEENqFfyorsbzHETk06VEgvagczzUkwnsR
-# 0CtRhbeLzaxDu2UGMyoUbeSDC6wpeftBIae0N4Vb+u88Ml3psmyX5vIBduJQ00hL
-# kTrgcBL63YcCrfgOmUMxOsTumkDPUPSaA5M9tlEnXo3lSQ/jfzrzJx+CPVg8h3E/
-# rssfpBbvvZ7mf0R9Kl7eAMSHw58jrvOuJA2V/7Ws3y9BjiW9YJeuZMCNJFDlI6bG
-# 0SPAugVCPD0VTyDtOavtPO1ZmA1nwRA36FKC8ZqWUF2mrzGCAdkwggHVAgEBMDgw
-# JDEiMCAGA1UEAwwZQUJHIEJheUFnZW50IENvZGUgU2lnbmluZwIQcB7+YhwgR7ZJ
-# ib3KL4WIcjAJBgUrDgMCGgUAoHgwGAYKKwYBBAGCNwIBDDEKMAigAoAAoQKAADAZ
-# BgkqhkiG9w0BCQMxDAYKKwYBBAGCNwIBBDAcBgorBgEEAYI3AgELMQ4wDAYKKwYB
-# BAGCNwIBFTAjBgkqhkiG9w0BCQQxFgQUFifHH7vnlypkUUkmY8mqly57IsMwDQYJ
-# KoZIhvcNAQEBBQAEggEAMPL/Q0UZ5s8gq9wlqdMjKxeBqETzzVsGGxPMEETCNWbq
-# bnBqs618nVF0JGnMU/SxyifuFeVITc6cUbgbcJlI40YxIeL/T8tjIgEPGWBOorcc
-# TDoqpcxiks2ExrwAzPPImDicDkkSOaNzI/cqKx36RgjRizntKCI0Zma29Bkt6rUD
-# ay3x3zH3Bi3Ry/zEOxq68ge8wrrdvatGES5k+IDWLMzMW5HmiNvIKfBL5ZBgG4Cs
-# 4Gx3mmfk7O56P44gJ4dTQoLc26vT78OyiP6HTGdTqoWfwEYsfLOa1/mKsXqEfVjV
-# 8oGYHnPpQ0zRXsyAnMrEf+hf1Rhb/9mOv8sTA5zr6g==
-# SIG # End signature block
