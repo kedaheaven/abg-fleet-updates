@@ -71,7 +71,7 @@ $wanted = @(
     "New-BayClientCertificate", "Export-PublicCertificate", "Build-CredentialEnrollResult",
     "Invoke-CredentialEnroll", "Invoke-CredentialTest", "Invoke-CredentialActivate", "Invoke-CredentialRetire",
     "Invoke-CredentialStatus", "Invoke-CredentialRotate",
-    "Limit-ResultJson", "New-BayClientCertificate"
+    "Limit-ResultJson", "New-BayClientCertificate", "Test-IsAgentOwnedCertificate"
 )
 $defs = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 $lifted = 0
@@ -456,6 +456,45 @@ try {
     $strOut = Limit-ResultJson -ResultObj ("z" * 5000)
     Assert-True ($strOut.Length -le $ResultJsonMaxChars) "an over-long string result is truncated to the cap"
     Assert-True ($strOut.EndsWith("...[truncated]")) "...and marked as truncated"
+
+    # ============================================================ T13 payload boundary (security review, 2026-08-29)
+    Section "T13 the CredentialRotate PAYLOAD cannot reach past the credential it manages"
+
+    # retire is the only DESTRUCTIVE action and its thumbprint is caller-supplied. A certificate this agent
+    # did not create and has not recorded must be untouchable - otherwise the payload is a
+    # delete-any-private-key primitive aimed at the bay's certificate stores.
+    $foreign = New-SelfSignedCertificate -Type Custom -Subject "CN=Some Other Thing" -CertStoreLocation "Cert:\CurrentUser\My" -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm sha256 -KeyExportPolicy NonExportable -KeyUsage DigitalSignature -NotAfter (Get-Date).AddDays(60) -FriendlyName "credtest foreign"
+    [void]$script:CreatedCerts.Add($foreign.Thumbprint)
+    Assert-True (-not (Test-IsAgentOwnedCertificate -Thumbprint $foreign.Thumbprint)) "a non-ABG certificate is not agent-owned"
+    Assert-Throws { Invoke-CredentialRetire @{ thumbprint = $foreign.Thumbprint } } "not an agent-owned certificate" `
+        "retire REFUSES a certificate this agent did not create"
+    Assert-True (Test-Path -LiteralPath "Cert:\CurrentUser\My\$($foreign.Thumbprint)") "...and the foreign certificate is still in the store"
+
+    # The positive half: an agent-made certificate IS retirable, so the guard has not simply disabled retire.
+    $ownDead = New-BayClientCertificate -Subject "CN=ABG-BayAgent retire-me" -ValidityDays 60 -Store "CurrentUser" -KeyLength 2048
+    [void]$script:CreatedCerts.Add($ownDead.Thumbprint)
+    Assert-True (Test-IsAgentOwnedCertificate -Thumbprint $ownDead.Thumbprint) "an ABG-BayAgent certificate IS agent-owned"
+    $retOwn = Invoke-CredentialRetire @{ thumbprint = $ownDead.Thumbprint }
+    Assert-True ($retOwn.ok -eq $true) "retire still works on an agent-owned certificate"
+    Assert-True (-not (Test-Path -LiteralPath "Cert:\CurrentUser\My\$($ownDead.Thumbprint)")) "...and it is actually gone"
+
+    # keyProvider reaches New-SelfSignedCertificate -Provider from the payload. Closed set, not free text.
+    Assert-Throws { New-BayClientCertificate -Subject "CN=ABG-BayAgent x" -KeyProvider "Some Arbitrary Provider" } "keyProvider must be" `
+        "an arbitrary keyProvider string is refused"
+
+    # THE ONE THAT MATTERS MOST: no payload field can move the token endpoint. The authority comes from
+    # agent-config.json only, so a command cannot point the bay at credential material the caller controls.
+    $sync["Requests"].Clear(); Reset-TokenState
+    $sync["CertResponse"] = @{ status = 200; body = '{"access_token":"tok-authority","expires_in":3600,"token_type":"Bearer"}' }
+    $poison = @{ action = "test"; thumbprint = $day0.thumbprint; tokenAuthorityHost = "http://127.0.0.1:9/evil"; authority = "http://evil.invalid"; url = "http://evil.invalid"; tokenUrl = "http://evil.invalid"; scope = "http://evil.invalid/.default" }
+    $poisonRes = Invoke-CredentialRotate $poison
+    Assert-True ($poisonRes.certificate.ok -eq $true) "a payload stuffed with authority/url fields still mints"
+    Assert-True (@($sync["Requests"]).Count -eq 1) "...and it made exactly one token request"
+    $preq = $sync["Requests"][0]
+    Assert-True ($preq.requestLine -eq "POST /$TenantId/oauth2/v2.0/token HTTP/1.1") "...to the CONFIGURED authority path, not one named in the payload (got '$($preq.requestLine)')"
+    Assert-True ($preq.headers -notmatch "evil") "...no payload-supplied host reached the request headers"
+    Assert-True ($preq.body -notmatch "evil") "...and no payload-supplied value reached the request body"
+    Assert-True ((Get-FormField $preq.body "scope") -eq "$OrgUrl/.default") "...the scope is still the CONFIGURED org, not the payload's"
 
     # ============================================================ T11 (opt-in): the real Entra endpoint parses the assertion
     if ($Live) {

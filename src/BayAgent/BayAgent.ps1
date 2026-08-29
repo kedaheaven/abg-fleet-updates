@@ -2759,8 +2759,12 @@ function New-BayClientCertificate {
     # Entra default for certificate credentials and is not the weak link in a 2-year bay credential.
     if ($KeyLength -notin @(2048, 3072)) { throw "keyLength must be 2048 or 3072 (4096 does not fit build_resultjson's 2000-char cap, so its public cert could not be returned remotely)" }
     if ($Subject.Length -gt 120) { throw "subject must be 120 characters or fewer (it shares build_resultjson's 2000-char budget with the public certificate)" }
+    # Closed set, not free text: keyProvider reaches New-SelfSignedCertificate -Provider from a caller-supplied
+    # payload, and an allow-list is cheaper than reasoning about what an arbitrary provider name can do.
     if ([string]::IsNullOrWhiteSpace($KeyProvider)) { $KeyProvider = "Microsoft Software Key Storage Provider" }
     elseif ($KeyProvider -ieq "tpm") { $KeyProvider = "Microsoft Platform Crypto Provider" }
+    elseif ($KeyProvider -ieq "software") { $KeyProvider = "Microsoft Software Key Storage Provider" }
+    else { throw "keyProvider must be 'software' or 'tpm' (got '$KeyProvider')" }
 
     # Non-exportable: the private key can be USED by this account but never copied off the machine. The client
     # authentication EKU is cosmetic for Entra (it keys on the thumbprint) but documents the intent.
@@ -2917,6 +2921,32 @@ function Invoke-CredentialActivate($payloadObj) {
     }
 }
 
+function Test-IsAgentOwnedCertificate {
+    # SECURITY BOUNDARY. retire is the only action that DESTROYS something, and its thumbprint comes
+    # straight from a caller-supplied BayCommand payload. Without this predicate the payload is a
+    # delete-any-certificate-with-its-private-key primitive against both of the agent account's stores -
+    # which has nothing to do with credential rotation and is not a capability this command should carry.
+    # A certificate is retirable ONLY if this agent made it (subject prefix) or this agent has recorded it
+    # in credential.json. Anything else on the machine is out of scope by construction.
+    param([Parameter(Mandatory=$true)][string]$Thumbprint)
+    $tp = Normalize-Thumbprint $Thumbprint
+    if (-not $tp) { return $false }
+
+    $st = Read-CredentialState
+    foreach ($k in @("pendingThumbprint", "previousThumbprint", "activeThumbprint")) {
+        $v = $null
+        try { $v = Normalize-Thumbprint ([string](Get-PropValue $st $k "")) } catch {}
+        if ($v -eq $tp) { return $true }
+    }
+    $prior = Get-PropValue $st "retiredThumbprints" $null
+    if ($prior) { foreach ($r in @($prior)) { if (("$r").ToUpperInvariant() -eq $tp) { return $true } } }
+
+    $c = Find-ClientCertificate $tp
+    if ($c -and ("$($c.Subject)").StartsWith("CN=ABG-BayAgent", [StringComparison]::OrdinalIgnoreCase)) { return $true }
+
+    return $false
+}
+
 function Invoke-CredentialRetire($payloadObj) {
     if ($null -eq $payloadObj) { $payloadObj = @{} }
     $tp = Normalize-Thumbprint ([string](Get-PropValue $payloadObj "thumbprint" ""))
@@ -2929,6 +2959,8 @@ function Invoke-CredentialRetire($payloadObj) {
     if ($tp) {
         # The credential the loop is living on is never removed.
         if ($tp -eq $active) { throw "retire: $tp is the ACTIVE credential; activate another certificate first" }
+        # ...and nothing this agent did not create or record is removable at all.
+        if (-not (Test-IsAgentOwnedCertificate -Thumbprint $tp)) { throw "retire: $tp is not an agent-owned certificate (subject must start CN=ABG-BayAgent, or the thumbprint must be recorded in credential.json); refusing to delete it" }
         $removedFrom = @()
         foreach ($store in (Get-CertStoreSearchOrder)) {
             $p = "$store\$tp"
