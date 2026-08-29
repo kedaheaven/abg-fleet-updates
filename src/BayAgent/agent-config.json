@@ -3,6 +3,7 @@
   "tenantId": redacted,
   "clientId": redacted,
   "clientSecretDpapiPath": "C:\\AllBirdies\\BayAgent\\secrets\\clientsecret.dpapi",
+  "clientCertThumbprint": "",
   "bayId": redacted,
   "pollSeconds": 3,
   "heartbeatSeconds": 60,

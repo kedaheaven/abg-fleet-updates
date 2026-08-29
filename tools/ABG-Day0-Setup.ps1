@@ -160,6 +160,7 @@ function Write-AgentConfigTemplateIfMissing([string]$path) {
   "tenantId": "<tenant-guid>",
   "clientId": "<app-client-id>",
   "clientSecretDpapiPath": "C:\\AllBirdies\\BayAgent\\secrets\\clientsecret.dpapi",
+  "clientCertThumbprint": "",
   "bayId": "<bay-guid>",
   "pollSeconds": 3,
   "heartbeatSeconds": 60,

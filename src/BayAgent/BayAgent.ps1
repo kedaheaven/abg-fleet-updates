@@ -3,6 +3,9 @@ ABG Bay Agent (Production Baseline v2 - includes periodic heartbeat)
 - Step 1 foundation: Entra client-credentials auth, Dataverse polling, optimistic lock, execute, report
 - Adds: automatic Bay heartbeat update every HeartbeatSeconds (default 60) even when no commands exist
 - Extend by adding new command handlers in Execute-Command()
+- Credential (2026-08-28): CERTIFICATE credential (client_assertion JWT signed by a key that never leaves the
+  Windows key store) is preferred; the DPAPI client secret is the transitional fallback; CredentialRotate
+  BayCommands enroll / test / activate / retire certificates without a visit to the machine.
 
 Run examples:
   # One-time auth + poll iteration then exit:
@@ -12,13 +15,23 @@ Run examples:
   powershell.exe -NoProfile -File "C:\AllBirdies\BayAgent\BayAgent.ps1"
 
 Optional switches:
-  -TokenOnly   Acquire token then exit (auth test)
+  -TokenOnly   Acquire token then exit (auth test; the log line names WHICH credential minted it)
   -Once        Run one poll iteration then exit
+  -EnrollCert  Generate a NEW certificate credential for this bay: a non-exportable RSA key pair in the
+               Windows certificate store, recorded in state\credential.json, with the PUBLIC certificate
+               written to state\bay-cert-<thumbprint>.cer and printed as base64. Needs no working
+               credential, so it is the Day-0 / hands-on enrollment path. If no credential is active
+               yet the new certificate becomes active immediately; otherwise it is PENDING until a
+               CredentialRotate action=activate proves it can mint a token.
+               Optional: -EnrollValidityDays <int> (default 730), -EnrollStore CurrentUser|LocalMachine
 #>
 
 param(
     [switch]$Once,
-    [switch]$TokenOnly
+    [switch]$TokenOnly,
+    [switch]$EnrollCert,
+    [int]$EnrollValidityDays = 730,
+    [ValidateSet("", "CurrentUser", "LocalMachine")][string]$EnrollStore = ""
 )
 
 Set-StrictMode -Version Latest
@@ -118,11 +131,47 @@ Require-Config "pollSeconds"
 
 $TenantId = $cfg.tenantId.ToString()
 $ClientId = $cfg.clientId.ToString()
-# Auth can be provided by:
-# - clientSecretDpapiPath (preferred)
-# - clientSecret (legacy fallback for transition)
-$Secret     = $null
-$SecretPath = $null
+# ---------------- Credential configuration ----------------
+# Three credential sources, tried in this order at token time (see Acquire-Token):
+#   1. clientCertThumbprint  - CERTIFICATE credential (preferred). The agent signs a client_assertion JWT with a
+#                              private key that never leaves the Windows certificate store (CurrentUser\My of the
+#                              agent account, or LocalMachine\My). Nothing to type, copy, or steal off disk.
+#                              An active thumbprint recorded by CredentialRotate / -EnrollCert in
+#                              state\credential.json OVERRIDES this value (that is how rotation lands without
+#                              rewriting agent-config.json).
+#   2. clientSecretDpapiPath - client SECRET, DPAPI(LocalMachine) protected. Kept as the transitional fallback so
+#                              a bay keeps working while its certificate is enrolled and registered in Entra.
+#   3. clientSecret          - DEPRECATED plaintext secret in agent-config.json. Still honoured so an existing bay
+#                              does not go dark on upgrade, but it is flagged in the heartbeat capabilities JSON
+#                              and logged at WARN on every start. Delete it once the bay reports
+#                              credential.lastMintMode = "certificate".
+# At least one source must be configured unless -EnrollCert is used (enrollment needs no credential).
+$Secret            = $null
+$SecretPath        = $null
+$SecretPathCfg     = $null
+$CertThumbprintCfg = $null
+$CertStoreCfg      = $null
+
+$CertThumbprintCfg = Get-ConfigString @("clientCertThumbprint")
+if ($CertThumbprintCfg) {
+    $CertThumbprintCfg = ($CertThumbprintCfg -replace "[^0-9A-Fa-f]", "").ToUpperInvariant()
+    if ($CertThumbprintCfg.Length -ne 40) { throw "clientCertThumbprint must be a 40-hex-character SHA-1 thumbprint in $CfgPath" }
+}
+$CertStoreCfg = Get-ConfigString @("clientCertStore")   # optional: CurrentUser | LocalMachine (default: search both)
+if ($CertStoreCfg -and $CertStoreCfg -notin @("CurrentUser", "LocalMachine")) { throw "clientCertStore must be CurrentUser or LocalMachine" }
+
+# Token authority host. Default is public Entra; overridable for sovereign clouds and for tests (the credential
+# test harness points it at a local mock token endpoint).
+$TokenAuthorityHost = Get-ConfigString @("tokenAuthorityHost")
+if ([string]::IsNullOrWhiteSpace($TokenAuthorityHost)) { $TokenAuthorityHost = "https://login.microsoftonline.com" }
+$TokenAuthorityHost = $TokenAuthorityHost.TrimEnd("/")
+
+# Assertion signing algorithm: RS256 (PKCS#1 v1.5 padding, accepted by Entra everywhere) or PS256 (PSS padding,
+# what Microsoft's current guidance recommends). Both are RSA + SHA-256; only the padding differs.
+$AssertionAlg = Get-ConfigString @("clientAssertionAlg")
+if ([string]::IsNullOrWhiteSpace($AssertionAlg)) { $AssertionAlg = "RS256" }
+$AssertionAlg = $AssertionAlg.ToUpperInvariant()
+if ($AssertionAlg -notin @("RS256", "PS256")) { throw "clientAssertionAlg must be RS256 or PS256 (got '$AssertionAlg') in $CfgPath" }
 
 $hasDpapiPath = ($cfg.PSObject.Properties.Name -contains "clientSecretDpapiPath") -and
                 (-not [string]::IsNullOrWhiteSpace($cfg.clientSecretDpapiPath))
@@ -131,21 +180,21 @@ $hasPlaintext = ($cfg.PSObject.Properties.Name -contains "clientSecret") -and
                 (-not [string]::IsNullOrWhiteSpace($cfg.clientSecret))
 
 if ($hasDpapiPath) {
-    $SecretPath = $cfg.clientSecretDpapiPath.ToString().Trim()
-
-    # Fail fast if configured but missing (don’t silently fall back)
-    if (!(Test-Path $SecretPath)) {
-        throw "clientSecretDpapiPath is set but file not found: $SecretPath"
-    }
-
-    Write-Log ("Auth mode: DPAPI (path={0})" -f $SecretPath) "INFO"
+    $SecretPathCfg = $cfg.clientSecretDpapiPath.ToString().Trim()
+    $SecretPath    = $SecretPathCfg
 }
 elseif ($hasPlaintext) {
     $Secret = $cfg.clientSecret.ToString().Trim()
-    Write-Log "Auth mode: PLAINTEXT (legacy)" "WARN"
 }
-else {
-    throw "Missing auth config: provide clientSecretDpapiPath (preferred) or clientSecret (legacy) in $CfgPath"
+
+# Finalised (file-existence checked, fallback semantics applied) in Write-CredentialStartupSummary below,
+# once the certificate helpers are defined.
+$HasSecretCredential = ($null -ne $SecretPath) -or ($null -ne $Secret)
+
+if (-not $EnrollCert) {
+    if (-not $CertThumbprintCfg -and -not $HasSecretCredential) {
+        throw "Missing auth config: provide clientCertThumbprint (preferred), clientSecretDpapiPath, or clientSecret (deprecated) in $CfgPath"
+    }
 }
 
 function Get-ClientSecret {
@@ -263,6 +312,14 @@ $Col_Payload      = "build_payload"
 $Col_Result       = "build_resultjson"
 $Col_Error        = "build_errordetails"
 
+# MEASURED 2026-08-29 against Dev: build_resultjson is a Memo column with MaxLength 2000. A PATCH that
+# exceeds it is REJECTED, and the reject lands in Process-Command's catch - so an oversized result does not
+# merely get clipped, it marks an otherwise SUCCESSFUL command as Failed. That is a silent-failure trap for
+# every command, and specifically it would turn a remote certificate enrollment (whose whole point is to
+# return the public cert without a visit to the bay) into a drive to the machine. Limit-ResultJson below is
+# the guard; keep this number in step with the column.
+$ResultJsonMaxChars = 2000
+
 # Lookup logical name for Bay lookup in BayCommand (Web API filter uses _{lookup}_value)
 $Lookup_Bay      = "build_bay"
 $Lookup_BayValue = "_{0}_value" -f $Lookup_Bay
@@ -311,6 +368,9 @@ $CMD_PROJECTOR_POWER  = 100000025
 $CMD_AUDIO_VOLUME     = 100000026
 $CMD_EMERGENCY_STOP   = 100000027
 
+# Credential lifecycle (2026-08-28): payload.action = status | enroll | test | activate | retire
+$CMD_CREDENTIAL_ROTATE = 100000030
+
 
 # Tracks the process started for Session Display so EndSession/Reset can close the right window
 $Global:SessionDisplayProcId = $null
@@ -347,26 +407,186 @@ function Read-WebExceptionBody {
     return $null
 }
 
-function Acquire-Token {
-    $tokenUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
-    $scope = "$OrgUrl/.default"
+# ---------------- Certificate credential (client_assertion) ----------------
+# State written by CredentialRotate commands and -EnrollCert. Precedence for the ACTIVE thumbprint:
+#   state\credential.json activeThumbprint  >  agent-config.json clientCertThumbprint
+$CredentialStatePath = Join-Path $BaseDir "state\credential.json"
 
-    $clientSecret = Get-ClientSecret
+# Telemetry (never a secret, never a key). Surfaced in build_agentcapabilitiesjson via the heartbeat so an
+# operator - and the credential-expiry monitor - can see WHICH credential is actually minting tokens.
+$Global:CredentialTelemetry = @{
+    lastMintMode      = $null     # "certificate" | "secret"
+    lastMintUtc       = $null
+    lastCertMintUtc   = $null
+    lastSecretMintUtc = $null
+    lastCertError     = $null
+    lastSecretError   = $null
+    fallbackCount     = 0
+    lastTest          = $null
+}
 
-    $body = @(
-        "client_id=$([uri]::EscapeDataString($ClientId))"
-        "client_secret=$([uri]::EscapeDataString($clientSecret))"
-        "grant_type=client_credentials"
-        "scope=$([uri]::EscapeDataString($scope))"
-    ) -join "&"
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+function ConvertTo-Base64Url([byte[]]$bytes) {
+    return [Convert]::ToBase64String($bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
+}
 
-    $req = [System.Net.HttpWebRequest]::Create($tokenUrl)
+function ConvertFrom-Base64Url([string]$s) {
+    $t = $s.Replace("-", "+").Replace("_", "/")
+    switch ($t.Length % 4) { 2 { $t += "==" } 3 { $t += "=" } }
+    return [Convert]::FromBase64String($t)
+}
+
+function Normalize-Thumbprint([string]$tp) {
+    if ([string]::IsNullOrWhiteSpace($tp)) { return $null }
+    $n = ($tp -replace "[^0-9A-Fa-f]", "").ToUpperInvariant()
+    if ($n.Length -ne 40) { throw "Thumbprint must be 40 hex characters (got '$tp')" }
+    return $n
+}
+
+function Read-CredentialState {
+    try {
+        if (Test-Path -LiteralPath $CredentialStatePath) {
+            $raw = Get-Content -LiteralPath $CredentialStatePath -Raw
+            if (-not [string]::IsNullOrWhiteSpace($raw)) { return ($raw | ConvertFrom-Json) }
+        }
+    } catch {
+        Write-Log ("credential.json unreadable ({0}); treating as absent" -f $_.Exception.Message) "WARN"
+    }
+    return $null
+}
+
+function Write-CredentialState($stateObj) {
+    $dir = Split-Path -Parent $CredentialStatePath
+    if (!(Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $json = ($stateObj | ConvertTo-Json -Depth 6)
+    $tmp = "$CredentialStatePath.tmp"
+    [IO.File]::WriteAllText($tmp, $json, (New-Object Text.UTF8Encoding($false)))
+    Move-Item -LiteralPath $tmp -Destination $CredentialStatePath -Force
+}
+
+function Update-CredentialState([hashtable]$changes) {
+    $cur = Read-CredentialState
+    $st = [ordered]@{}
+    if ($cur) { foreach ($p in $cur.PSObject.Properties) { $st[$p.Name] = $p.Value } }
+    foreach ($k in $changes.Keys) { $st[$k] = $changes[$k] }
+    $st["updatedUtc"] = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    Write-CredentialState $st
+    return $st
+}
+
+function Get-ActiveCertThumbprint {
+    $st = Read-CredentialState
+    $fromState = Normalize-Thumbprint ([string](Get-PropValue $st "activeThumbprint" ""))
+    if ($fromState) { return $fromState }
+    return $CertThumbprintCfg
+}
+
+function Get-PendingCertThumbprint {
+    $st = Read-CredentialState
+    return (Normalize-Thumbprint ([string](Get-PropValue $st "pendingThumbprint" "")))
+}
+
+function Get-CertStoreSearchOrder {
+    $stores = @("Cert:\CurrentUser\My", "Cert:\LocalMachine\My")
+    if ($CertStoreCfg) {
+        $pref = "Cert:\$CertStoreCfg\My"
+        $stores = @($pref) + @($stores | Where-Object { $_ -ne $pref })
+    }
+    return $stores
+}
+
+function Get-CertStoreName($cert) {
+    try {
+        $pp = [string]$cert.PSParentPath
+        if ($pp -and $pp.Contains("::")) { return ($pp -split "::")[-1] }
+    } catch {}
+    return "?"
+}
+
+function Find-ClientCertificate([string]$thumbprint) {
+    $tp = Normalize-Thumbprint $thumbprint
+    if (-not $tp) { return $null }
+    foreach ($store in (Get-CertStoreSearchOrder)) {
+        try {
+            $c = Get-ChildItem -LiteralPath "$store\$tp" -ErrorAction SilentlyContinue
+            if ($c -and $c.HasPrivateKey) { return $c }
+        } catch {}
+    }
+    return $null
+}
+
+function New-ClientAssertionJwt {
+    # RFC 7523 / Entra "certificate credentials" assertion. Header carries BOTH thumbprint forms (x5t = SHA-1,
+    # x5t#S256 = SHA-256) so either lookup Entra performs succeeds; claims are the documented set.
+    param(
+        [Parameter(Mandatory=$true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [Parameter(Mandatory=$true)][string]$ClientId,
+        [Parameter(Mandatory=$true)][string]$Audience,
+        [string]$Alg = "RS256",
+        [int]$LifetimeSeconds = 300
+    )
+    $der    = $Certificate.RawData
+    $sha1   = [System.Security.Cryptography.SHA1]::Create().ComputeHash($der)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create().ComputeHash($der)
+
+    $header = [ordered]@{
+        alg        = $Alg
+        typ        = "JWT"
+        x5t        = (ConvertTo-Base64Url $sha1)
+        "x5t#S256" = (ConvertTo-Base64Url $sha256)
+    }
+
+    # nbf is backdated 60 s to absorb clock skew between the bay PC and Entra; exp stays short (5 min default).
+    $now = [DateTimeOffset]::UtcNow
+    $claims = [ordered]@{
+        aud = $Audience
+        iss = $ClientId
+        sub = $ClientId
+        jti = ([guid]::NewGuid().ToString())
+        nbf = $now.AddSeconds(-60).ToUnixTimeSeconds()
+        iat = $now.ToUnixTimeSeconds()
+        exp = $now.AddSeconds($LifetimeSeconds).ToUnixTimeSeconds()
+    }
+
+    $enc = [Text.Encoding]::UTF8
+    $h64 = ConvertTo-Base64Url ($enc.GetBytes(($header | ConvertTo-Json -Compress)))
+    $p64 = ConvertTo-Base64Url ($enc.GetBytes(($claims | ConvertTo-Json -Compress)))
+    $signingInput = $enc.GetBytes("$h64.$p64")
+
+    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Certificate)
+    if ($null -eq $rsa) { throw "Certificate $($Certificate.Thumbprint) has no usable RSA private key for this account" }
+    $padding = if ($Alg -eq "PS256") { [System.Security.Cryptography.RSASignaturePadding]::Pss } else { [System.Security.Cryptography.RSASignaturePadding]::Pkcs1 }
+    $sig = $rsa.SignData($signingInput, [System.Security.Cryptography.HashAlgorithmName]::SHA256, $padding)
+
+    return ("{0}.{1}.{2}" -f $h64, $p64, (ConvertTo-Base64Url $sig))
+}
+
+function Get-AadstsCode([string]$text) {
+    if ([string]::IsNullOrWhiteSpace($text)) { return "" }
+    $m = [regex]::Match($text, "AADSTS\d+")
+    if ($m.Success) { return $m.Value }
+    return ""
+}
+
+function Get-TokenUrl {
+    return "$TokenAuthorityHost/$TenantId/oauth2/v2.0/token"
+}
+
+function Invoke-TokenEndpoint {
+    # One POST to the v2.0 token endpoint. Returns the parsed JSON on 2xx; throws otherwise with the HTTP status
+    # and AADSTS code in the message. The request body is never logged (it may carry the secret).
+    param(
+        [Parameter(Mandatory=$true)][string]$TokenUrl,
+        [Parameter(Mandatory=$true)][string]$FormBody
+    )
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($FormBody)
+
+    $req = [System.Net.HttpWebRequest]::Create($TokenUrl)
     $req.Method = "POST"
     $req.ContentType = "application/x-www-form-urlencoded"
     $req.Accept = "application/json"
     $req.Timeout = 30000
     $req.ReadWriteTimeout = 30000
+    try { $req.ServicePoint.Expect100Continue = $false } catch {}
 
     $reqStream = $req.GetRequestStream()
     $reqStream.Write($bytes, 0, $bytes.Length)
@@ -385,6 +605,8 @@ function Acquire-Token {
         if ($resp -ne $null) {
             try { $statusCode = [int]$resp.StatusCode } catch {}
             $respText = Read-WebExceptionBody -WebException $_.Exception
+        } else {
+            throw "Token endpoint unreachable: $($_.Exception.Message)"
         }
     }
 
@@ -399,7 +621,8 @@ function Acquire-Token {
     if ($statusCode -lt 200 -or $statusCode -ge 300) {
         if ([string]::IsNullOrWhiteSpace($respText)) { $respText = "<empty>" }
         Write-Log "Token failed (HTTP $statusCode). Body: $respText" "ERROR"
-        throw "Token request failed with HTTP $statusCode"
+        $code = Get-AadstsCode $respText
+        throw ("Token request failed with HTTP {0}{1}" -f $statusCode, $(if ($code) { " ($code)" } else { "" }))
     }
 
     $json = $respText | ConvertFrom-Json
@@ -407,16 +630,176 @@ function Acquire-Token {
         Write-Log "Token success but missing access_token. Raw: $respText" "ERROR"
         throw "No access_token in token response."
     }
+    return $json
+}
+
+function Acquire-TokenWithCertificate {
+    # Mints with ONE named certificate and does NOT touch the token cache or telemetry - so it doubles as the
+    # proof step for activate / test / retire.
+    param([Parameter(Mandatory=$true)][string]$Thumbprint)
+    $cert = Find-ClientCertificate $Thumbprint
+    if ($null -eq $cert) { throw "Certificate $Thumbprint (with private key) not found in $((Get-CertStoreSearchOrder) -join ', ')" }
+    if ($cert.NotAfter.ToUniversalTime() -lt (Get-Date).ToUniversalTime()) { throw "Certificate $Thumbprint expired $($cert.NotAfter.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))" }
+
+    $tokenUrl  = Get-TokenUrl
+    $assertion = New-ClientAssertionJwt -Certificate $cert -ClientId $ClientId -Audience $tokenUrl -Alg $AssertionAlg
+    $body = @(
+        "client_id=$([uri]::EscapeDataString($ClientId))"
+        "client_assertion_type=$([uri]::EscapeDataString('urn:ietf:params:oauth:client-assertion-type:jwt-bearer'))"
+        "client_assertion=$assertion"
+        "grant_type=client_credentials"
+        "scope=$([uri]::EscapeDataString("$OrgUrl/.default"))"
+    ) -join "&"
+    return (Invoke-TokenEndpoint -TokenUrl $tokenUrl -FormBody $body)
+}
+
+function Acquire-TokenWithSecret {
+    $clientSecret = Get-ClientSecret
+    $body = @(
+        "client_id=$([uri]::EscapeDataString($ClientId))"
+        "client_secret=$([uri]::EscapeDataString($clientSecret))"
+        "grant_type=client_credentials"
+        "scope=$([uri]::EscapeDataString("$OrgUrl/.default"))"
+    ) -join "&"
+    return (Invoke-TokenEndpoint -TokenUrl (Get-TokenUrl) -FormBody $body)
+}
+
+function Acquire-Token {
+    # Certificate first when one is active; the client secret is the transitional fallback. Every fallback is
+    # logged and counted, so a silently-broken certificate path cannot hide behind a still-working secret.
+    $json = $null
+    $mode = $null
+    $activeTp = Get-ActiveCertThumbprint
+    $nowStr = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+    if ($activeTp) {
+        try {
+            $json = Acquire-TokenWithCertificate -Thumbprint $activeTp
+            $mode = "certificate"
+            $Global:CredentialTelemetry.lastCertMintUtc = $nowStr
+            $Global:CredentialTelemetry.lastCertError   = $null
+        } catch {
+            $Global:CredentialTelemetry.lastCertError = $_.Exception.Message
+            if ($HasSecretCredential) {
+                $Global:CredentialTelemetry.fallbackCount++
+                Write-Log ("Certificate credential {0} failed ({1}); falling back to the client secret" -f $activeTp, $_.Exception.Message) "WARN"
+            } else {
+                throw
+            }
+        }
+    }
+
+    if ($null -eq $json) {
+        try {
+            $json = Acquire-TokenWithSecret
+            $mode = "secret"
+            $Global:CredentialTelemetry.lastSecretMintUtc = $nowStr
+            $Global:CredentialTelemetry.lastSecretError   = $null
+        } catch {
+            $Global:CredentialTelemetry.lastSecretError = $_.Exception.Message
+            throw
+        }
+    }
 
     # Cache expiry with a 5-minute safety buffer
     $expiresIn = 3600
     try { if ($json.expires_in) { $expiresIn = [int]$json.expires_in } } catch {}
     $Global:AccessToken = $json.access_token
     $Global:TokenExpiresUtc = (Get-Date).ToUniversalTime().AddSeconds($expiresIn - 300)
+    $Global:CredentialTelemetry.lastMintMode = $mode
+    $Global:CredentialTelemetry.lastMintUtc  = $nowStr
 
-    Write-Log "Token acquired; expires approx $($Global:TokenExpiresUtc.ToString('yyyy-MM-ddTHH:mm:ssZ'))" "DEBUG"
+    Write-Log "Token acquired via $mode; expires approx $($Global:TokenExpiresUtc.ToString('yyyy-MM-ddTHH:mm:ssZ'))" "DEBUG"
     return $Global:AccessToken
 }
+
+function Get-CredentialTelemetry {
+    # Everything an operator or the expiry monitor needs, nothing an attacker wants.
+    $activeTp = $null; $pendingTp = $null
+    try { $activeTp  = Get-ActiveCertThumbprint } catch {}
+    try { $pendingTp = Get-PendingCertThumbprint } catch {}
+
+    $certInfo = $null
+    if ($activeTp) {
+        $c = Find-ClientCertificate $activeTp
+        if ($c) {
+            $certInfo = [ordered]@{
+                found       = $true
+                subject     = $c.Subject
+                store       = (Get-CertStoreName $c)
+                notBeforeUtc = $c.NotBefore.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                notAfterUtc  = $c.NotAfter.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                daysToExpiry = [int][Math]::Floor(($c.NotAfter.ToUniversalTime() - (Get-Date).ToUniversalTime()).TotalDays)
+            }
+        } else {
+            $certInfo = [ordered]@{ found = $false }
+        }
+    }
+
+    $secretMode = "none"
+    if ($SecretPath) { $secretMode = "dpapi" } elseif ($Secret) { $secretMode = "plaintext" }
+
+    $t = $Global:CredentialTelemetry
+    return [ordered]@{
+        schema                 = 1
+        configuredMode         = $(if ($activeTp) { "certificate" } else { "secret" })
+        activeThumbprint       = $activeTp
+        activeCertificate      = $certInfo
+        pendingThumbprint      = $pendingTp
+        secretConfigured       = $secretMode
+        plaintextSecretPresent = ($null -ne $Secret)
+        assertionAlg           = $AssertionAlg
+        lastMintMode           = $t.lastMintMode
+        lastMintUtc            = $t.lastMintUtc
+        lastCertMintUtc        = $t.lastCertMintUtc
+        lastSecretMintUtc      = $t.lastSecretMintUtc
+        lastCertError          = $t.lastCertError
+        lastSecretError        = $t.lastSecretError
+        fallbackCount          = $t.fallbackCount
+        lastTest               = $t.lastTest
+    }
+}
+
+function Write-CredentialStartupSummary {
+    # Finalises the fallback secret (file existence) and logs which credential the loop will run on.
+    # Fail-fast rule: a configured-but-missing DPAPI file is FATAL only when the secret is the ONLY credential.
+    # With a certificate active it is a WARN, so CredentialRotate action=retire secret=true cannot brick a
+    # restart while clientSecretDpapiPath is still present in agent-config.json.
+    $activeTp = Get-ActiveCertThumbprint
+    $cert = $null
+    if ($activeTp) { $cert = Find-ClientCertificate $activeTp }
+
+    if ($SecretPathCfg -and -not (Test-Path -LiteralPath $SecretPathCfg)) {
+        if ($cert) {
+            Write-Log ("clientSecretDpapiPath is set but the file is missing ({0}); certificate-only, no secret fallback" -f $SecretPathCfg) "WARN"
+            $script:SecretPath = $null
+            $script:HasSecretCredential = ($null -ne $script:Secret)
+        } else {
+            throw "clientSecretDpapiPath is set but file not found: $SecretPathCfg"
+        }
+    }
+
+    $fallbackLabel = "none"
+    if ($script:SecretPath) { $fallbackLabel = "dpapi" } elseif ($script:Secret) { $fallbackLabel = "plaintext" }
+
+    if ($activeTp) {
+        if ($cert) {
+            Write-Log ("Auth mode: CERTIFICATE thumbprint={0} store={1} notAfter={2} fallbackSecret={3}" -f $activeTp, (Get-CertStoreName $cert), $cert.NotAfter.ToUniversalTime().ToString("yyyy-MM-dd"), $fallbackLabel) "INFO"
+        } elseif ($script:HasSecretCredential) {
+            Write-Log ("Auth mode: CERTIFICATE thumbprint={0} is configured but NOT FOUND in {1}; running on the client secret ({2}) until it is" -f $activeTp, ((Get-CertStoreSearchOrder) -join ", "), $fallbackLabel) "WARN"
+        } else {
+            throw "Certificate $activeTp is configured but no certificate with a private key was found in $((Get-CertStoreSearchOrder) -join ', '), and no secret fallback is configured"
+        }
+    } else {
+        if ($script:SecretPath) { Write-Log ("Auth mode: SECRET (DPAPI path={0}); no certificate enrolled yet - send CredentialRotate action=enroll" -f $script:SecretPath) "INFO" }
+        elseif ($script:Secret) { Write-Log "Auth mode: SECRET (PLAINTEXT clientSecret in agent-config.json - DEPRECATED)" "WARN" }
+    }
+    if ($script:Secret) {
+        Write-Log "DEPRECATED: agent-config.json carries a plaintext clientSecret. Enroll a certificate (CredentialRotate action=enroll) and delete the key; it is reported in the heartbeat as plaintextSecretPresent=true" "WARN"
+    }
+}
+
+if (-not $EnrollCert) { Write-CredentialStartupSummary }
 
 function Get-AccessToken {
     $now = (Get-Date).ToUniversalTime()
@@ -483,6 +866,57 @@ function Dataverse-WhoAmI {
     $uri = "$OrgUrl/api/data/v9.2/WhoAmI()"
     $res = Invoke-DvSafe -Method GET -Uri $uri -Headers (New-DvHeaders $token)
     Write-Log ("WhoAmI OK: UserId={0} OrgId={1} BU={2}" -f $res.UserId, $res.OrganizationId, $res.BusinessUnitId) "INFO"
+}
+
+function Limit-ResultJson {
+    # Serialise a command result so it ALWAYS fits build_resultjson. Bulky-but-optional keys are dropped in a
+    # defined order (least useful first) before any hard truncation, so the load-bearing values - ok, action,
+    # thumbprint, publicCertBase64 - survive. Anything dropped is named in the result, so a reader can never
+    # mistake a trimmed result for a complete one.
+    param(
+        [Parameter(Mandatory=$true)]$ResultObj,
+        [int]$MaxChars = 0
+    )
+    if ($MaxChars -le 0) { $MaxChars = $ResultJsonMaxChars }
+
+    if ($ResultObj -is [string]) {
+        if ($ResultObj.Length -le $MaxChars) { return $ResultObj }
+        return ($ResultObj.Substring(0, [Math]::Max(0, $MaxChars - 15)) + "...[truncated]")
+    }
+
+    $json = ($ResultObj | ConvertTo-Json -Depth 10 -Compress)
+    if ($json.Length -le $MaxChars) { return $json }
+
+    # Rebuild as an ordered map we can prune. Drop order: prose and paths first, identity and key material last.
+    $map = [ordered]@{}
+    if ($ResultObj -is [System.Collections.IDictionary]) {
+        foreach ($k in @($ResultObj.Keys)) { $map[$k] = $ResultObj[$k] }
+    } else {
+        foreach ($prop in $ResultObj.PSObject.Properties) { $map[$prop.Name] = $prop.Value }
+    }
+    $dropOrder = @("next", "publicCertPath", "subject", "notBeforeUtc", "store", "reused", "activatedDirectly", "state", "certificates")
+    $dropped = @()
+    foreach ($k in $dropOrder) {
+        if (-not $map.Contains($k)) { continue }
+        $map.Remove($k)
+        $dropped += $k
+        $map["resultTrimmed"] = $true
+        $map["resultDroppedKeys"] = ($dropped -join ",")
+        $json = ($map | ConvertTo-Json -Depth 10 -Compress)
+        if ($json.Length -le $MaxChars) { return $json }
+    }
+
+    # Still too big: the key material itself cannot fit. Say so explicitly and point at the on-disk copy rather
+    # than shipping a half base64 blob that looks like a certificate and is not one.
+    if ($map.Contains("publicCertBase64")) {
+        $map["publicCertBase64"] = $null
+        $map["publicCertBase64Omitted"] = "too large for build_resultjson; read state\bay-cert-<thumbprint>.cer on the bay, or re-enroll with keyLength 2048"
+        $map["resultTrimmed"] = $true
+        $json = ($map | ConvertTo-Json -Depth 10 -Compress)
+        if ($json.Length -le $MaxChars) { return $json }
+    }
+
+    return ($json.Substring(0, [Math]::Max(0, $MaxChars - 15)) + "...[truncated]")
 }
 
 function Patch-Row {
@@ -792,11 +1226,16 @@ function Build-AgentCapabilitiesJson {
             jsonPathExists  = ([string]::IsNullOrWhiteSpace([string]$sessionJson) -eq $false -and (Test-Path -LiteralPath $sessionJson))
         }
 
+        # Credential health (no secrets, no keys): which credential is configured, which one actually minted
+        # the last token, when the active certificate expires. Read by operators and the expiry monitor.
+        credential = (Get-CredentialTelemetry)
+
         # Keep this conservative; expand as you add commands.
         supportedCommandTypes = @(
             "HealthCheck",
             "StartSession",
-            "EndSession"
+            "EndSession",
+            "CredentialRotate"
         )
     }
 
@@ -920,7 +1359,8 @@ function Is-CommandAllowedInMode {
             $CommandType -eq $CMD_HEALTHCHECK -or
             $CommandType -eq $CMD_SHOWMESSAGE -or
             $CommandType -eq $CMD_QUERYPROCESS -or
-            $CommandType -eq $CMD_DISPLAY_TOPOLOGY
+            $CommandType -eq $CMD_DISPLAY_TOPOLOGY -or
+            $CommandType -eq $CMD_CREDENTIAL_ROTATE
         )
     }
 
@@ -2289,6 +2729,296 @@ $Global:EmergencyStopReason = $null
     return @{ stopped = $true; url = $url; profileDir = $profileDir; killedPids = $killList }
 }
 
+# ---------------- Credential lifecycle (CredentialRotate command, -EnrollCert) ----------------
+# The rotation contract, in order:
+#   enroll   - mint a NEW non-exportable key pair on this machine; publish the PUBLIC cert (result JSON +
+#              state\bay-cert-<tp>.cer); record it as PENDING. The old credential keeps working.
+#   (Entra)  - the operator registers the public cert on the app (keyCredential). Nothing on the bay changes.
+#   test     - prove a named / pending certificate mints a real token. Changes nothing.
+#   activate - prove the candidate mints a token, THEN switch the active thumbprint and drop the cached token.
+#              A failed proof leaves the active credential untouched (the command is marked Failed).
+#   (Entra)  - once the heartbeat shows credential.lastMintMode = "certificate", the operator deletes the old
+#              secret / old certificate on the app.
+#   retire   - remove an old certificate from the store, and/or the DPAPI secret file (only after a live proof
+#              that the active certificate mints). The active credential can never be retired.
+function New-BayClientCertificate {
+    param(
+        [string]$Subject = "",
+        [int]$ValidityDays = 730,
+        [string]$Store = "CurrentUser",
+        [string]$KeyProvider = "",
+        [int]$KeyLength = 2048
+    )
+    if ([string]::IsNullOrWhiteSpace($Subject)) { $Subject = "CN=ABG-BayAgent $BayId" }
+    if ($Store -notin @("CurrentUser", "LocalMachine")) { throw "store must be CurrentUser or LocalMachine" }
+    if ($ValidityDays -lt 30 -or $ValidityDays -gt 1825) { throw "validityDays must be between 30 and 1825" }
+    # 4096 is deliberately NOT offered over the BayCommand path. MEASURED 2026-08-29: an RSA-4096 public cert is
+    # 1808 base64 chars, and the enroll result carrying it is 2324 - over build_resultjson's 2000-char cap even
+    # after Limit-ResultJson has dropped every optional field. The cert would then be reachable only by reading
+    # state\bay-cert-<tp>.cer ON the machine, which defeats the entire point of remote enrollment. 2048 is the
+    # Entra default for certificate credentials and is not the weak link in a 2-year bay credential.
+    if ($KeyLength -notin @(2048, 3072)) { throw "keyLength must be 2048 or 3072 (4096 does not fit build_resultjson's 2000-char cap, so its public cert could not be returned remotely)" }
+    if ($Subject.Length -gt 120) { throw "subject must be 120 characters or fewer (it shares build_resultjson's 2000-char budget with the public certificate)" }
+    if ([string]::IsNullOrWhiteSpace($KeyProvider)) { $KeyProvider = "Microsoft Software Key Storage Provider" }
+    elseif ($KeyProvider -ieq "tpm") { $KeyProvider = "Microsoft Platform Crypto Provider" }
+
+    # Non-exportable: the private key can be USED by this account but never copied off the machine. The client
+    # authentication EKU is cosmetic for Entra (it keys on the thumbprint) but documents the intent.
+    $cert = New-SelfSignedCertificate `
+        -Type Custom `
+        -Subject $Subject `
+        -CertStoreLocation "Cert:\$Store\My" `
+        -KeyAlgorithm RSA -KeyLength $KeyLength -HashAlgorithm sha256 `
+        -KeyExportPolicy NonExportable `
+        -KeyUsage DigitalSignature `
+        -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.2") `
+        -Provider $KeyProvider `
+        -NotAfter (Get-Date).AddDays($ValidityDays) `
+        -FriendlyName ("ABG BayAgent credential " + (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd"))
+    if (-not $cert.HasPrivateKey) { throw "Certificate created but no private key present" }
+
+    # Re-read through the provider so the object carries its store path (PSParentPath).
+    $stored = Get-ChildItem -LiteralPath ("Cert:\{0}\My\{1}" -f $Store, $cert.Thumbprint) -ErrorAction SilentlyContinue
+    if ($stored) { return $stored }
+    return $cert
+}
+
+function Export-PublicCertificate($cert) {
+    $dir = Join-Path $BaseDir "state"
+    if (!(Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $path = Join-Path $dir ("bay-cert-{0}.cer" -f $cert.Thumbprint)
+    [IO.File]::WriteAllBytes($path, $cert.RawData)     # DER, public half only
+    return $path
+}
+
+function Build-CredentialEnrollResult($cert, [string]$cerPath, [bool]$reused, [bool]$activatedDirectly) {
+    return [ordered]@{
+        ok                = $true
+        action            = "enroll"
+        reused            = $reused
+        activatedDirectly = $activatedDirectly
+        thumbprint        = $cert.Thumbprint
+        subject           = $cert.Subject
+        store             = (Get-CertStoreName $cert)
+        notBeforeUtc      = $cert.NotBefore.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        notAfterUtc       = $cert.NotAfter.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        publicCertBase64  = [Convert]::ToBase64String($cert.RawData)   # DER; register this as the app's certificate credential
+        publicCertPath    = $cerPath
+        next              = $(if ($activatedDirectly) { "Register publicCertBase64 on the Entra app, then run BayAgent.ps1 -TokenOnly (or send CredentialRotate action=test) to prove the mint" } else { "Register publicCertBase64 on the Entra app, then send CredentialRotate action=activate" })
+    }
+}
+
+function Invoke-CredentialEnroll($payloadObj) {
+    if ($null -eq $payloadObj) { $payloadObj = @{} }
+    $force = [bool](Get-PropValue $payloadObj "force" $false)
+
+    $pending = Get-PendingCertThumbprint
+    if ($pending -and -not $force) {
+        $existing = Find-ClientCertificate $pending
+        if ($existing) {
+            # Idempotent: a retried enroll returns the pending certificate instead of minting another key pair.
+            return (Build-CredentialEnrollResult -cert $existing -cerPath (Export-PublicCertificate $existing) -reused $true -activatedDirectly $false)
+        }
+    }
+
+    $cert = New-BayClientCertificate `
+        -Subject      ([string](Get-PropValue $payloadObj "subject" "")) `
+        -ValidityDays ([int](Get-PropValue $payloadObj "validityDays" 730)) `
+        -Store        ([string](Get-PropValue $payloadObj "store" "CurrentUser")) `
+        -KeyProvider  ([string](Get-PropValue $payloadObj "keyProvider" "")) `
+        -KeyLength    ([int](Get-PropValue $payloadObj "keyLength" 2048))
+    $cerPath = Export-PublicCertificate $cert
+    $nowStr = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+    # A bay with NO credential at all (fresh Day-0) has nothing to protect and nothing to prove against: the new
+    # certificate becomes active at once. Any bay that already has a credential gets a PENDING certificate.
+    $activeTp = Get-ActiveCertThumbprint
+    $activateNow = (-not $activeTp) -and (-not $HasSecretCredential)
+    if ($activateNow) {
+        Update-CredentialState @{ activeThumbprint = $cert.Thumbprint; pendingThumbprint = $null; activatedUtc = $nowStr; enrolledUtc = $nowStr } | Out-Null
+        Write-Log ("Credential enrolled AND activated (no prior credential): certificate {0} notAfter={1}; public cert at {2}" -f $cert.Thumbprint, $cert.NotAfter.ToUniversalTime().ToString("yyyy-MM-dd"), $cerPath) "INFO"
+    } else {
+        Update-CredentialState @{ pendingThumbprint = $cert.Thumbprint; enrolledUtc = $nowStr } | Out-Null
+        Write-Log ("Credential enrolled as PENDING: certificate {0} notAfter={1}; public cert at {2}. Register it in Entra, then activate." -f $cert.Thumbprint, $cert.NotAfter.ToUniversalTime().ToString("yyyy-MM-dd"), $cerPath) "INFO"
+    }
+    return (Build-CredentialEnrollResult -cert $cert -cerPath $cerPath -reused $false -activatedDirectly $activateNow)
+}
+
+function Invoke-CredentialTest($payloadObj) {
+    if ($null -eq $payloadObj) { $payloadObj = @{} }
+    $tp = Normalize-Thumbprint ([string](Get-PropValue $payloadObj "thumbprint" ""))
+    if (-not $tp) { $tp = Get-PendingCertThumbprint }
+    if (-not $tp) { $tp = Get-ActiveCertThumbprint }
+    $nowStr = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+    $res = [ordered]@{ ok = $false; action = "test"; certificate = $null; secret = $null }
+    if ($tp) {
+        try {
+            $j = Acquire-TokenWithCertificate -Thumbprint $tp
+            $res.certificate = [ordered]@{ ok = $true; thumbprint = $tp; expiresIn = $j.expires_in }
+        } catch {
+            $res.certificate = [ordered]@{ ok = $false; thumbprint = $tp; error = $_.Exception.Message }
+        }
+        $Global:CredentialTelemetry.lastTest = [ordered]@{ utc = $nowStr; thumbprint = $tp; ok = $res.certificate.ok }
+    } else {
+        $res.certificate = [ordered]@{ ok = $false; error = "no certificate thumbprint given, pending, or active" }
+    }
+
+    if ([bool](Get-PropValue $payloadObj "includeSecret" $false)) {
+        if ($HasSecretCredential) {
+            try {
+                $j2 = Acquire-TokenWithSecret
+                $res.secret = [ordered]@{ ok = $true; expiresIn = $j2.expires_in; source = $(if ($SecretPath) { "dpapi" } else { "plaintext" }) }
+            } catch {
+                $res.secret = [ordered]@{ ok = $false; error = $_.Exception.Message }
+            }
+        } else {
+            $res.secret = [ordered]@{ ok = $false; configured = $false }
+        }
+    }
+
+    $res.ok = ($res.certificate.ok -eq $true)
+    return $res
+}
+
+function Invoke-CredentialActivate($payloadObj) {
+    if ($null -eq $payloadObj) { $payloadObj = @{} }
+    $tp = Normalize-Thumbprint ([string](Get-PropValue $payloadObj "thumbprint" ""))
+    if (-not $tp) { $tp = Get-PendingCertThumbprint }
+    if (-not $tp) { throw "activate: no thumbprint given and no pending certificate enrolled" }
+
+    $cert = Find-ClientCertificate $tp
+    if (-not $cert) { throw "activate: certificate $tp with a private key not found in $((Get-CertStoreSearchOrder) -join ', ')" }
+
+    # PROVE before switching. A real token mint with the candidate; if this throws nothing below runs and the
+    # active credential is untouched (Process-Command marks the command Failed with the AADSTS code).
+    $j = Acquire-TokenWithCertificate -Thumbprint $tp
+
+    $prevActive = Get-ActiveCertThumbprint
+    $nowStr = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $changes = @{ activeThumbprint = $tp; activatedUtc = $nowStr }
+    if ((Get-PendingCertThumbprint) -eq $tp) { $changes.pendingThumbprint = $null }
+    if ($prevActive -and $prevActive -ne $tp) { $changes.previousThumbprint = $prevActive }
+    Update-CredentialState $changes | Out-Null
+
+    # Drop the cached token so the very next loop iteration mints with the new certificate.
+    $Global:AccessToken = $null
+    $Global:TokenExpiresUtc = [DateTime]::MinValue
+
+    Write-Log ("Credential activated: certificate {0} is now the active credential (previous: {1})" -f $tp, $(if ($prevActive) { $prevActive } else { "secret" })) "INFO"
+    return [ordered]@{
+        ok                 = $true
+        action             = "activate"
+        activeThumbprint   = $tp
+        previousThumbprint = $prevActive
+        notAfterUtc        = $cert.NotAfter.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        proof              = [ordered]@{ mintedWithCertificate = $true; expiresIn = $j.expires_in }
+        next               = "Wait for a heartbeat showing credential.lastMintMode = certificate, THEN delete the old secret/certificate on the Entra app, THEN send action=retire"
+    }
+}
+
+function Invoke-CredentialRetire($payloadObj) {
+    if ($null -eq $payloadObj) { $payloadObj = @{} }
+    $tp = Normalize-Thumbprint ([string](Get-PropValue $payloadObj "thumbprint" ""))
+    $retireSecret = [bool](Get-PropValue $payloadObj "secret" $false)
+    if (-not $tp -and -not $retireSecret) { throw "retire: give thumbprint and/or secret=true" }
+
+    $active = Get-ActiveCertThumbprint
+    $result = [ordered]@{ ok = $true; action = "retire" }
+
+    if ($tp) {
+        # The credential the loop is living on is never removed.
+        if ($tp -eq $active) { throw "retire: $tp is the ACTIVE credential; activate another certificate first" }
+        $removedFrom = @()
+        foreach ($store in (Get-CertStoreSearchOrder)) {
+            $p = "$store\$tp"
+            if (Test-Path -LiteralPath $p) {
+                Remove-Item -LiteralPath $p -DeleteKey -Force
+                $removedFrom += $store
+            }
+        }
+        $changes = @{}
+        if ((Get-PendingCertThumbprint) -eq $tp) { $changes.pendingThumbprint = $null }
+        $st = Read-CredentialState
+        if ([string](Get-PropValue $st "previousThumbprint" "") -eq $tp) { $changes.previousThumbprint = $null }
+        $retired = @()
+        $prior = Get-PropValue $st "retiredThumbprints" $null
+        if ($prior) { $retired = @($prior) }
+        $retired += $tp
+        $changes.retiredThumbprints = $retired
+        Update-CredentialState $changes | Out-Null
+        $result.certificate = [ordered]@{ thumbprint = $tp; removedFrom = $removedFrom; wasInStore = ($removedFrom.Count -gt 0) }
+        Write-Log ("Credential retired: certificate {0} removed from {1}" -f $tp, $(if ($removedFrom.Count) { $removedFrom -join ", " } else { "(not present)" })) "INFO"
+    }
+
+    if ($retireSecret) {
+        if (-not $active) { throw "retire secret: no active certificate; refusing to remove the only credential" }
+        # Live proof RIGHT NOW that the active certificate mints - not a cached token, not a remembered success.
+        $null = Acquire-TokenWithCertificate -Thumbprint $active
+        $secretRes = [ordered]@{ proofMintedWithCertificate = $active }
+        if ($script:SecretPath) {
+            try {
+                Remove-Item -LiteralPath $script:SecretPath -Force
+                $secretRes.dpapiFileRemoved = $true
+                $script:SecretPath = $null
+                $script:HasSecretCredential = ($null -ne $script:Secret)
+                Write-Log "Credential retired: DPAPI secret file removed; certificate-only from now on" "INFO"
+            } catch {
+                $secretRes.dpapiFileRemoved = $false
+                $secretRes.error = $_.Exception.Message
+                $result.ok = $false
+            }
+        } else {
+            $secretRes.dpapiFileRemoved = $false
+            $secretRes.note = "no DPAPI secret file configured"
+        }
+        if ($script:Secret) {
+            $secretRes.plaintextSecretStillInConfig = $true
+            $secretRes.note = "agent-config.json clientSecret must be deleted by hand; the agent never rewrites its own config"
+        }
+        $result.secret = $secretRes
+    }
+
+    return $result
+}
+
+function Invoke-CredentialStatus {
+    $certs = @()
+    foreach ($store in @("Cert:\CurrentUser\My", "Cert:\LocalMachine\My")) {
+        try {
+            foreach ($c in @(Get-ChildItem -LiteralPath $store -ErrorAction SilentlyContinue | Where-Object { $_.Subject -like "CN=ABG-BayAgent*" })) {
+                $certs += [ordered]@{
+                    thumbprint    = $c.Thumbprint
+                    subject       = $c.Subject
+                    store         = ($store -replace "^Cert:\\", "")
+                    hasPrivateKey = $c.HasPrivateKey
+                    notAfterUtc   = $c.NotAfter.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                }
+            }
+        } catch {}
+    }
+    return [ordered]@{
+        ok           = $true
+        action       = "status"
+        credential   = (Get-CredentialTelemetry)
+        state        = (Read-CredentialState)
+        certificates = $certs
+    }
+}
+
+function Invoke-CredentialRotate($payloadObj) {
+    if ($null -eq $payloadObj) { $payloadObj = @{} }
+    $action = ([string](Get-PropValue $payloadObj "action" "status")).ToLowerInvariant()
+    switch ($action) {
+        "status"   { return (Invoke-CredentialStatus) }
+        "enroll"   { return (Invoke-CredentialEnroll $payloadObj) }
+        "test"     { return (Invoke-CredentialTest $payloadObj) }
+        "activate" { return (Invoke-CredentialActivate $payloadObj) }
+        "retire"   { return (Invoke-CredentialRetire $payloadObj) }
+        default    { throw "CredentialRotate: unknown action '$action' (status | enroll | test | activate | retire)" }
+    }
+}
+
 function Execute-Command {
     param(
         [Parameter(Mandatory=$true)][int]$CommandType,
@@ -2403,6 +3133,10 @@ $CMD_EMERGENCY_STOP {
     return (Invoke-EmergencyStopInternal -payloadObj $payloadObj)
 }
 
+
+        $CMD_CREDENTIAL_ROTATE {
+            return (Invoke-CredentialRotate $payloadObj)
+        }
 
         $CMD_SHOWMESSAGE {
             $title = Get-PropValue $payloadObj "title" "All Birdies"
@@ -2885,12 +3619,9 @@ $bayLabelFromCmd = Get-BayLabelFromCommandRow $cmd
 $resultObj = Execute-Command -CommandType $type -PayloadJson $payload -BayLabel $bayLabelFromCmd
         # Dataverse text columns (e.g., build_resultjson) require a STRING.
         # The baseline Step 1 agent returned JSON strings; we preserve that behavior here.
-        $resultJson = $null
-        if ($resultObj -is [string]) {
-            $resultJson = $resultObj
-        } else {
-            $resultJson = ($resultObj | ConvertTo-Json -Depth 10 -Compress)
-        }
+        # Limit-ResultJson, not a bare ConvertTo-Json: build_resultjson is capped at 2000 chars and an
+        # over-length PATCH would fail the command in the catch below even though the work succeeded.
+        $resultJson = Limit-ResultJson -ResultObj $resultObj
 
         $now2 = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         Patch-Row $token $BayCommandEntitySet $cmdId @{
@@ -2942,6 +3673,26 @@ $resultObj = Execute-Command -CommandType $type -PayloadJson $payload -BayLabel 
     }
 }
 
+# ---------------- -EnrollCert: hands-on / Day-0 enrollment (no credential needed) ----------------
+if ($EnrollCert) {
+    $enrollPayload = @{ validityDays = $EnrollValidityDays; force = $true }
+    if ($EnrollStore) { $enrollPayload.store = $EnrollStore }
+    $r = Invoke-CredentialEnroll $enrollPayload
+    Write-Host ""
+    Write-Host ("ENROLLED certificate credential for bay {0}" -f $BayId)
+    Write-Host ("  Thumbprint  : {0}" -f $r.thumbprint)
+    Write-Host ("  Subject     : {0}" -f $r.subject)
+    Write-Host ("  Store       : {0}" -f $r.store)
+    Write-Host ("  NotAfter    : {0}" -f $r.notAfterUtc)
+    Write-Host ("  State       : {0}" -f $(if ($r.activatedDirectly) { "ACTIVE (no prior credential)" } else { "PENDING (activate after registering in Entra)" }))
+    Write-Host ("  Public cert : {0}" -f $r.publicCertPath)
+    Write-Host "  Public cert (base64 DER) - register as a certificate credential on the Entra app:"
+    Write-Host $r.publicCertBase64
+    Write-Host ""
+    Write-Host ("  Next: {0}" -f $r.next)
+    exit 0
+}
+
 # ---------------- Main Loop ----------------
 $didWhoAmI = $false
 
@@ -2950,7 +3701,7 @@ while ($true) {
         $token = Get-AccessToken
 
         if ($TokenOnly) {
-            Write-Log "TokenOnly mode: token acquired. Exiting." "INFO"
+            Write-Log ("TokenOnly mode: token acquired via {0}. Exiting." -f $Global:CredentialTelemetry.lastMintMode) "INFO"
             break
         }
 
@@ -2987,35 +3738,3 @@ while ($true) {
     Start-Sleep -Seconds $PollSec
 }
 
-# SIG # Begin signature block
-# MIIFiwYJKoZIhvcNAQcCoIIFfDCCBXgCAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
-# gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
-# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUu9UtF9gRDCE4mtdEFIDwm5uP
-# WdCgggMcMIIDGDCCAgCgAwIBAgIQcB7+YhwgR7ZJib3KL4WIcjANBgkqhkiG9w0B
-# AQsFADAkMSIwIAYDVQQDDBlBQkcgQmF5QWdlbnQgQ29kZSBTaWduaW5nMB4XDTI2
-# MDEwMzExMjAyNloXDTI3MDEwMzExNDAyNlowJDEiMCAGA1UEAwwZQUJHIEJheUFn
-# ZW50IENvZGUgU2lnbmluZzCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB
-# AMHHQzWuIzBHO6BwscGzuoCN3bquhA+YTha7xYBsvX/eatjwlCpT4buJXeVZvoHQ
-# OOcMsKg+kt+taj9s/gv2Arm0rh730JVHtJcSm0X96L+GI29bjydtSFqLl8iAtCvh
-# 1EQoakIaxXTVGXKxMNEnhNwIocdDETF1wT1kkZ/bCDZyPY5Y0/iEcRc5CAKAhF/H
-# IrIJXd/QL4esRkg1HkmDCOoHD3vZkQAWLgTLchRFE6Uk10RAHwJmpHBWo/pjho0L
-# tGNFDRJvgXGpO6hbSSjxu5gyznnDWd2chg/xW6WLJ3dhqFpYIixOR+gBJumVS46F
-# 8jFj+hT8MfWxzhpX3NtQf2ECAwEAAaNGMEQwDgYDVR0PAQH/BAQDAgeAMBMGA1Ud
-# JQQMMAoGCCsGAQUFBwMDMB0GA1UdDgQWBBTlEn8ZOjY/C0/ILYEj+knQETbTMzAN
-# BgkqhkiG9w0BAQsFAAOCAQEATPNqtG54FSKaVvJ/XtuHqccWzTJ3koMG6gq+jlLE
-# OiOhQ7auwTNPRy42er59N79LInazh5pEENqFfyorsbzHETk06VEgvagczzUkwnsR
-# 0CtRhbeLzaxDu2UGMyoUbeSDC6wpeftBIae0N4Vb+u88Ml3psmyX5vIBduJQ00hL
-# kTrgcBL63YcCrfgOmUMxOsTumkDPUPSaA5M9tlEnXo3lSQ/jfzrzJx+CPVg8h3E/
-# rssfpBbvvZ7mf0R9Kl7eAMSHw58jrvOuJA2V/7Ws3y9BjiW9YJeuZMCNJFDlI6bG
-# 0SPAugVCPD0VTyDtOavtPO1ZmA1nwRA36FKC8ZqWUF2mrzGCAdkwggHVAgEBMDgw
-# JDEiMCAGA1UEAwwZQUJHIEJheUFnZW50IENvZGUgU2lnbmluZwIQcB7+YhwgR7ZJ
-# ib3KL4WIcjAJBgUrDgMCGgUAoHgwGAYKKwYBBAGCNwIBDDEKMAigAoAAoQKAADAZ
-# BgkqhkiG9w0BCQMxDAYKKwYBBAGCNwIBBDAcBgorBgEEAYI3AgELMQ4wDAYKKwYB
-# BAGCNwIBFTAjBgkqhkiG9w0BCQQxFgQU++M39mvNnxEN4VE6kxP/R7ToeVUwDQYJ
-# KoZIhvcNAQEBBQAEggEAm6DE7qJpN+i2DIK8xhnqg7E/XikdqFzhIiyI3QRSLy0N
-# 1o91m/tJ7cr/T1WtKlSm1Ep6KUjY/VSdeRALVqzTgtZErL0fxS/7C5/mPa+hNn4L
-# Iyx7n3RMIlhIVCB+jVnSow0HybDbA0Ot8cwo2k9SALr5lH1bPkwuWej3UBoRFt1d
-# 9FjfR+5F7ovp8u0oTaeXbsR2ynptv77KnLNzgUuW2N7CmH0qVDxumwoLf7aEDmwJ
-# 3bEMn1Ipg0AvPo24WupBYuLowQGr4MbexUWmJJlTUpJ4Ol5p9ffZOFOHkyb0VGwh
-# 0FbKkhYvAIhZVINteuYdem/5roXma1ibylSjd/Mwvw==
-# SIG # End signature block
