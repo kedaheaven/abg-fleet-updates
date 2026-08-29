@@ -421,7 +421,9 @@ $Global:CredentialTelemetry = @{
     lastSecretMintUtc = $null
     lastCertError     = $null
     lastSecretError   = $null
-    fallbackCount     = 0
+    fallbackCount     = 0     # THIS PROCESS only - see Sync-FallbackTelemetry for the durable total
+    fallbackFlushed   = 0     # how much of fallbackCount has already been folded into credential.json
+    lastFallbackUtc   = $null
     lastTest          = $null
 }
 
@@ -682,6 +684,7 @@ function Acquire-Token {
             $Global:CredentialTelemetry.lastCertError = $_.Exception.Message
             if ($HasSecretCredential) {
                 $Global:CredentialTelemetry.fallbackCount++
+                $Global:CredentialTelemetry.lastFallbackUtc = $nowStr
                 Write-Log ("Certificate credential {0} failed ({1}); falling back to the client secret" -f $activeTp, $_.Exception.Message) "WARN"
             } else {
                 throw
@@ -711,6 +714,38 @@ function Acquire-Token {
 
     Write-Log "Token acquired via $mode; expires approx $($Global:TokenExpiresUtc.ToString('yyyy-MM-ddTHH:mm:ssZ'))" "DEBUG"
     return $Global:AccessToken
+}
+
+function Sync-FallbackTelemetry {
+    # A certificate that fails on EVERY loop while the secret quietly carries the bay is the exact silent state
+    # this counter exists to expose - and an in-memory counter cannot expose it, because the Host Watchdog
+    # restarts the agent routinely (restart.host markers, ONLOGON re-launch). Each restart would zero the count
+    # and the bay would look healthy while running on a credential that is days from expiry.
+    #
+    # So the total is DURABLE: the session delta is folded into credential.json. Flushing happens here rather
+    # than at the increment because this runs on the capabilities cadence (~10 min), not the 3-second poll -
+    # a broken certificate would otherwise rewrite the state file every 3 seconds. The flush is idempotent:
+    # only the not-yet-flushed delta is added, so calling it twice cannot double-count.
+    $t = $Global:CredentialTelemetry
+    $persisted = 0
+    $st = Read-CredentialState
+    try { $persisted = [int](Get-PropValue $st "fallbackCountTotal" 0) } catch { $persisted = 0 }
+
+    $delta = [int]$t.fallbackCount - [int]$t.fallbackFlushed
+    if ($delta -gt 0) {
+        $persisted = $persisted + $delta
+        try {
+            $changes = @{ fallbackCountTotal = $persisted }
+            if ($t.lastFallbackUtc) { $changes.lastFallbackUtc = $t.lastFallbackUtc }
+            Update-CredentialState $changes | Out-Null
+            $t.fallbackFlushed = $t.fallbackCount
+        } catch {
+            # Never let telemetry bookkeeping break a heartbeat. The delta stays unflushed and is retried.
+            Write-Log ("Could not persist fallback telemetry: {0}" -f $_.Exception.Message) "WARN"
+            $persisted = $persisted - $delta
+        }
+    }
+    return $persisted
 }
 
 function Get-CredentialTelemetry {
@@ -755,7 +790,9 @@ function Get-CredentialTelemetry {
         lastSecretMintUtc      = $t.lastSecretMintUtc
         lastCertError          = $t.lastCertError
         lastSecretError        = $t.lastSecretError
-        fallbackCount          = $t.fallbackCount
+        fallbackCount          = $t.fallbackCount        # this process
+        fallbackCountTotal     = (Sync-FallbackTelemetry)  # durable across restarts - the one a monitor should read
+        lastFallbackUtc        = $t.lastFallbackUtc
         lastTest               = $t.lastTest
     }
 }

@@ -71,7 +71,7 @@ $wanted = @(
     "New-BayClientCertificate", "Export-PublicCertificate", "Build-CredentialEnrollResult",
     "Invoke-CredentialEnroll", "Invoke-CredentialTest", "Invoke-CredentialActivate", "Invoke-CredentialRetire",
     "Invoke-CredentialStatus", "Invoke-CredentialRotate",
-    "Limit-ResultJson", "New-BayClientCertificate", "Test-IsAgentOwnedCertificate"
+    "Limit-ResultJson", "New-BayClientCertificate", "Test-IsAgentOwnedCertificate", "Sync-FallbackTelemetry"
 )
 $defs = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 $lifted = 0
@@ -108,6 +108,15 @@ $Global:TokenExpiresUtc = [DateTime]::MinValue
 $Global:CredentialTelemetry = @{
     lastMintMode = $null; lastMintUtc = $null; lastCertMintUtc = $null; lastSecretMintUtc = $null
     lastCertError = $null; lastSecretError = $null; fallbackCount = 0; lastTest = $null
+    fallbackFlushed = 0; lastFallbackUtc = $null
+}
+function Reset-TelemetryAsIfRestarted {
+    # Exactly what a Host Watchdog restart does to the in-memory counters: wipes them.
+    $Global:CredentialTelemetry = @{
+        lastMintMode = $null; lastMintUtc = $null; lastCertMintUtc = $null; lastSecretMintUtc = $null
+        lastCertError = $null; lastSecretError = $null; fallbackCount = 0; lastTest = $null
+        fallbackFlushed = 0; lastFallbackUtc = $null
+    }
 }
 $script:CreatedCerts = New-Object System.Collections.ArrayList
 
@@ -495,6 +504,50 @@ try {
     Assert-True ($preq.headers -notmatch "evil") "...no payload-supplied host reached the request headers"
     Assert-True ($preq.body -notmatch "evil") "...and no payload-supplied value reached the request body"
     Assert-True ((Get-FormField $preq.body "scope") -eq "$OrgUrl/.default") "...the scope is still the CONFIGURED org, not the payload's"
+
+    # ============================================================ T14 enrollment input bounds + durable fallback count
+    Section "T14 enrollment input bounds are pinned, and the fallback count survives a restart"
+
+    # Same class of caller-supplied input as keyLength, which is already refused. Pin the rest of the bounds so
+    # a later edit cannot quietly widen them.
+    Assert-Throws { New-BayClientCertificate -Subject "CN=ABG-BayAgent b" -ValidityDays 29 } "validityDays must be between 30 and 1825" `
+        "validityDays below the floor is refused"
+    Assert-Throws { New-BayClientCertificate -Subject "CN=ABG-BayAgent b" -ValidityDays 1826 } "validityDays must be between 30 and 1825" `
+        "validityDays above the ceiling is refused"
+    Assert-Throws { New-BayClientCertificate -Subject "CN=ABG-BayAgent b" -Store "Bogus" } "store must be CurrentUser or LocalMachine" `
+        "an unknown certificate store is refused"
+    Assert-Throws { Invoke-CredentialEnroll @{ store = "\attacker\share" } } "store must be CurrentUser or LocalMachine" `
+        "...including when it arrives through the CredentialRotate payload"
+
+    # THE POINT: a bay whose certificate fails every loop, running on the secret, must not be able to hide that
+    # by restarting. The Host Watchdog restarts the agent routinely, so an in-memory-only counter reads zero on
+    # a bay that has been silently falling back for days.
+    # Start from a clean slate on BOTH halves: the durable total AND the flush watermark. Earlier tests
+    # (T3 exercises the fallback path) have already advanced both, and setting fallbackCount absolutely
+    # without resetting fallbackFlushed would measure a delta, not a total.
+    Update-CredentialState @{ fallbackCountTotal = 0 } | Out-Null
+    Reset-TelemetryAsIfRestarted
+    $Global:CredentialTelemetry.fallbackCount = 3
+    $Global:CredentialTelemetry.lastFallbackUtc = "2026-08-29T12:00:00Z"
+    $tel1 = Get-CredentialTelemetry
+    Assert-True ($tel1.fallbackCountTotal -eq 3) "three fallbacks are folded into the durable total"
+    Assert-True ($tel1.fallbackCount -eq 3) "...and the session counter still reports this process"
+
+    $tel2 = Get-CredentialTelemetry
+    Assert-True ($tel2.fallbackCountTotal -eq 3) "flushing twice does NOT double-count (the flush is idempotent)"
+
+    Reset-TelemetryAsIfRestarted
+    $tel3 = Get-CredentialTelemetry
+    Assert-True ($tel3.fallbackCount -eq 0) "after a restart the SESSION counter is zero, as it must be"
+    Assert-True ($tel3.fallbackCountTotal -eq 3) "...but the DURABLE total survives the restart - the bay cannot hide it"
+    Assert-True ([string](Get-PropValue (Read-CredentialState) "lastFallbackUtc" "") -eq "2026-08-29T12:00:00Z") `
+        "...and WHEN it last fell back is on disk too, so the monitor can age it"
+
+    $Global:CredentialTelemetry.fallbackCount = 2
+    $tel4 = Get-CredentialTelemetry
+    Assert-True ($tel4.fallbackCountTotal -eq 5) "post-restart fallbacks ACCUMULATE onto the durable total (3 + 2)"
+    $stTotal = [int](Get-PropValue (Read-CredentialState) "fallbackCountTotal" 0)
+    Assert-True ($stTotal -eq 5) "...and the total is actually on disk in credential.json, not just in memory"
 
     # ============================================================ T11 (opt-in): the real Entra endpoint parses the assertion
     if ($Live) {
